@@ -211,6 +211,17 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         )
         self.policy = self.policy.to(self.device)
 
+        self.policy_list = []
+        for _ in range(self.n_envs):
+            policy = self.policy_class(
+                                            self.observation_space,
+                                            self.action_space,
+                                            self.lr_schedule,
+                                            **self.policy_kwargs,
+                                        )
+            policy = policy.to(self.device)
+            self.policy_list.append(policy)
+
         # Convert train freq parameter to TrainFreq object
         self._convert_train_freq()
 

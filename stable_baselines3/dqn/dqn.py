@@ -5,6 +5,7 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
+import copy
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
@@ -12,6 +13,9 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import LinearSchedule, get_parameters_by_name, polyak_update
 from stable_baselines3.dqn.policies import CnnPolicy, DQNPolicy, MlpPolicy, MultiInputPolicy, QNetwork
+from stable_baselines3.common.type_aliases import ReplayBufferSamples
+
+
 
 SelfDQN = TypeVar("SelfDQN", bound="DQN")
 
@@ -184,6 +188,29 @@ class DQN(OffPolicyAlgorithm):
         self.exploration_rate = self.exploration_schedule(self._current_progress_remaining)
         self.logger.record("rollout/exploration_rate", self.exploration_rate)
 
+    '''
+    def _training_step(self, replay_data: ReplayBufferSamples) -> th.Tensor:
+        # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+        discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
+
+        with th.no_grad():
+            # Compute the next Q-values using the target network
+            next_q_values = self.q_net_target(replay_data.next_observations)
+            # Follow greedy policy: use the one with the highest value
+            next_q_values, _ = next_q_values.max(dim=1)
+            # Avoid potential broadcast issue
+            next_q_values = next_q_values.reshape(-1, 1)
+            # 1-step TD target
+            target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
+
+        # Get current Q-values estimates
+        current_q_values = self.q_net(replay_data.observations)
+
+        # Retrieve the q-values for the actions from the replay buffer
+        current_q_values = th.gather(current_q_values, dim=1, index=replay_data.actions.long())
+        return F.smooth_l1_loss(current_q_values, target_q_values)
+        '''
+    
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
@@ -191,38 +218,70 @@ class DQN(OffPolicyAlgorithm):
         self._update_learning_rate(self.policy.optimizer)
 
         losses = []
+        loss_list = [0]*self.n_envs
         for _ in range(gradient_steps):
-            # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
-            # For n-step replay, discount factor is gamma**n_steps (when no early termination)
-            discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
+            for i in range(self.n_envs):
+                print(i)
+                print(len(self.policy_list))
+                self.policy_list[i].set_training_mode(True)
+                self._update_learning_rate(self.policy_list[i].optimizer)
+                
+                # Sample replay buffer
+                replay_data = self.replay_buffer.federated_sample(batch_size, env=self._vec_normalize_env, env_ind = i)  # type: ignore[union-attr]            
+                print("actions")
+                print(replay_data.actions)
+                        # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+                discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
+        
+                with th.no_grad():
+                    # Compute the next Q-values using the target network
+                    next_q_values = self.policy_list[i].q_net_target(replay_data.next_observations)
+                    # Follow greedy policy: use the one with the highest value
+                    next_q_values, _ = next_q_values.max(dim=1)
+                    # Avoid potential broadcast issue
+                    next_q_values = next_q_values.reshape(-1, 1)
+                    # 1-step TD target
+                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
+        
+                # Get current Q-values estimates
+                current_q_values = self.policy_list[i].q_net(replay_data.observations)
+        
+                # Retrieve the q-values for the actions from the replay buffer
+                current_q_values = th.gather(current_q_values, dim=1, index=replay_data.actions.long())
+                
+                # Compute Huber loss (less sensitive to outliers)
+                loss_list[i] = F.smooth_l1_loss(current_q_values, target_q_values)
+                print(i)
+                print(loss_list[i])
+                losses.append(loss_list[i].item())
 
-            with th.no_grad():
-                # Compute the next Q-values using the target network
-                next_q_values = self.q_net_target(replay_data.next_observations)
-                # Follow greedy policy: use the one with the highest value
-                next_q_values, _ = next_q_values.max(dim=1)
-                # Avoid potential broadcast issue
-                next_q_values = next_q_values.reshape(-1, 1)
-                # 1-step TD target
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
+                # Optimize the local policy
+                self.policy_list[i].optimizer.zero_grad()
+                loss_list[i].backward()
+                # Clip gradient norm
+                th.nn.utils.clip_grad_norm_(self.policy_list[i].parameters(), self.max_grad_norm)
+                self.policy_list[i].optimizer.step()
 
-            # Get current Q-values estimates
-            current_q_values = self.q_net(replay_data.observations)
 
-            # Retrieve the q-values for the actions from the replay buffer
-            current_q_values = th.gather(current_q_values, dim=1, index=replay_data.actions.long())
+            base_state = self.policy_list[0].state_dict()
+            state_dict = {}
+            for layer in base_state:
+                state_dict[layer] = th.sum(th.stack([th.mul(self.policy_list[i].state_dict()[layer], 1/self.n_envs) for i in range(self.n_envs)]), dim=0)
 
-            # Compute Huber loss (less sensitive to outliers)
-            loss = F.smooth_l1_loss(current_q_values, target_q_values)
-            losses.append(loss.item())
-
+            #base_layer = list(state_dict.keys())[0]
+           
+            self.policy.load_state_dict(state_dict)
+            for i in range(self.n_envs):
+                self.policy_list[i].load_state_dict(state_dict)
+            
+            '''
             # Optimize the policy
             self.policy.optimizer.zero_grad()
             loss.backward()
             # Clip gradient norm
             th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.policy.optimizer.step()
+            '''
 
         # Increase update counter
         self._n_updates += gradient_steps

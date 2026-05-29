@@ -2,7 +2,16 @@
 
 1) Lancer DQN simple et vérifier qu'on a les mêmes perfs en monitoring que StableBaselines
 
-2) Faire un DQN fédéré avec moyenne des poids comme agrégation (envs homogènes)
-   - run 2 DQN trainings in sequential
-   - run 2 DQN trainings in parallel (torch.vfunc ?)
-   - do the aggregation for the 2 DQN each N iterations
+3) Clean (federated) code
+
+4) Handle metrics monitoring : local -> server
+
+5) Comparison for DQN: federated vs centralized vs federated w/o communication
+
+Later:
+
+1) Other models than DQN
+
+2) Other aggregation strategies
+
+3) Parallel local trainings (torch.vfunc/vmap ?)

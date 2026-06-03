@@ -3,7 +3,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from client import FederatedDQNClient
-
+import wandb
 
 class FederatedDQNServer:
     """
@@ -21,14 +21,18 @@ class FederatedDQNServer:
         self.global_parameters = self.clients[0].get_parameters()
         self.round = 0
 
-    def train_round(self, total_timesteps: int, **learn_kwargs: Any) -> dict[str, Any]:
+    def train_round(self,
+                    total_timesteps: int,
+                    wand_run: wandb.sdk.wandb_run.Run | None,
+                    **learn_kwargs: Any) -> dict[str, Any]:
         """Run one federated round over all clients."""
         client_results = []
-
+        
         for client in self.clients:
             parameters, weight, metrics = client.fit(
                 self.global_parameters,
                 total_timesteps,
+                wand_run,
                 **learn_kwargs,
             )
             client_results.append((parameters, weight, metrics))
@@ -50,12 +54,15 @@ class FederatedDQNServer:
         self,
         num_rounds: int,
         total_timesteps_per_round: int,
+        wand_run: wandb.sdk.wandb_run.Run | None,
         **learn_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Run several federated rounds."""
         history = []
         for _ in range(num_rounds):
-            history.append(self.train_round(total_timesteps_per_round, **learn_kwargs))
+            history.append(self.train_round(total_timesteps_per_round,
+                                            wand_run,
+                                            **learn_kwargs))
         return history
 
     def broadcast(self, parameters: list[np.ndarray]) -> None:

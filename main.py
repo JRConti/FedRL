@@ -10,6 +10,7 @@ from server import FederatedDQNServer
 from stable_baselines3 import DQN
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
+import wandb
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,24 +53,43 @@ def make_env(env_id: str, seed: int) -> gym.Env:
     return Monitor(env)
 
 
-def make_model(env_id: str, seed: int, args: argparse.Namespace) -> DQN:
+def make_model(env_id: str,
+               seed: int,
+               args: argparse.Namespace,
+               wand_run: wandb.sdk.wandb_run.Run | None) -> DQN:
     env = make_env(env_id, seed)
-    return DQN(
-        "MlpPolicy",
-        env,
-        seed=seed,
-        learning_starts=args.learning_starts,
-        buffer_size=args.buffer_size,
-        batch_size=args.batch_size,
-        verbose=args.verbose,
-    )
+    if wand_run is None:
+        return DQN(
+            "MlpPolicy",
+            env,
+            seed=seed,
+            learning_starts=args.learning_starts,
+            buffer_size=args.buffer_size,
+            batch_size=args.batch_size,
+            verbose=args.verbose,
+        )
+
+    else:
+        return DQN(
+            "MlpPolicy",
+            env,
+            seed=seed,
+            learning_starts=args.learning_starts,
+            buffer_size=args.buffer_size,
+            batch_size=args.batch_size,
+            verbose=args.verbose,
+            tensorboard_log=f"runs/{wand_run.id}",
+        )
 
 
-def build_server(args: argparse.Namespace) -> FederatedDQNServer:
+def build_server(args: argparse.Namespace, wand_run: wandb.sdk.wandb_run.Run | None) -> FederatedDQNServer:
     clients = []
     for client_id in range(args.num_clients):
         client_seed = args.seed + client_id
-        model = make_model(args.env_id, client_seed, args)
+        if client_id == 0:
+            model = make_model(args.env_id, client_seed, args, wand_run)
+        else:
+            model = make_model(args.env_id, client_seed, args, None)
         clients.append(FederatedDQNClient(client_id=client_id, model=model))
     return FederatedDQNServer(clients)
 
@@ -89,8 +109,12 @@ def load_global_parameters(model: DQN, parameters: list[np.ndarray]) -> None:
 def evaluate_global_model(
     server: FederatedDQNServer,
     args: argparse.Namespace,
+    wand_run: wandb.sdk.wandb_run.Run | None,
 ) -> tuple[float, float]:
-    eval_model = make_model(args.env_id, args.seed + 10_000, args)
+    eval_model = make_model(args.env_id,
+                            args.seed + 10_000,
+                            args,
+                            wand_run)
     load_global_parameters(eval_model, server.global_parameters)
     mean_reward, std_reward = evaluate_policy(
         eval_model,
@@ -119,18 +143,30 @@ def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Nam
 
 def main() -> None:
     args = parse_args()
-    server = build_server(args)
+    config = {
+        "policy_type": "DQN",
+        "env_name": args.env_id,
+        "total_timesteps": (args.timesteps_per_round * args.num_rounds)
+    }
+    run = wandb.init(
+        project="FedRL-sb3",
+        config=config,
+        sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+        #monitor_gym=True,  # auto-upload the videos of agents playing the game
+        #save_code=True,  # optional
+    )
+    server = build_server(args, run)
 
     history = []
     for _ in range(args.num_rounds):
-        round_metrics = server.train_round(args.timesteps_per_round)
+        round_metrics = server.train_round(args.timesteps_per_round, run)
         history.append(round_metrics)
         print(
             f"Round {round_metrics['round']}/{args.num_rounds} "
             f"completed with {round_metrics['num_clients']} clients."
         )
 
-    mean_reward, std_reward = evaluate_global_model(server, args)
+    mean_reward, std_reward = evaluate_global_model(server, args, run)
     final_eval = {
         "mean_reward": mean_reward,
         "std_reward": std_reward,
@@ -148,7 +184,8 @@ def main() -> None:
     if args.save_model is not None:
         save_global_model(args.save_model, server, args)
         print(f"Saved final global model to {args.save_model}")
-
+        
+    run.finish()
 
 if __name__ == "__main__":
     main()

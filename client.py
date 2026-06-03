@@ -4,6 +4,8 @@ import numpy as np
 import torch as th
 
 from stable_baselines3 import DQN
+import wandb
+from wandb.integration.sb3 import WandbCallback
 
 
 class FederatedDQNClient:
@@ -26,12 +28,26 @@ class FederatedDQNClient:
         self.aggregation_weight = aggregation_weight
         self.sync_target_network = sync_target_network
 
-    def train(self, total_timesteps: int, **learn_kwargs: Any) -> dict[str, Any]:
+    def train(self,
+              total_timesteps: int,
+              wand_run: wandb.sdk.wandb_run.Run | None,
+              **learn_kwargs: Any) -> dict[str, Any]:
         """Train the local DQN model for one federated round."""
         learn_kwargs.setdefault("reset_num_timesteps", False)
-
         timesteps_before = self.model.num_timesteps
-        self.model.learn(total_timesteps=total_timesteps, **learn_kwargs)
+
+        if wand_run is None:
+            self.model.learn(total_timesteps=total_timesteps,
+                             **learn_kwargs)
+        else:
+            wandCallBack=WandbCallback(
+                gradient_save_freq=100,
+                model_save_path=f"models/{wand_run.id}",
+                verbose=2,
+            )
+            self.model.learn(total_timesteps=total_timesteps,
+                             callback=wandCallBack,
+                             **learn_kwargs)
         trained_timesteps = self.model.num_timesteps - timesteps_before
 
         return {
@@ -69,6 +85,7 @@ class FederatedDQNClient:
         self,
         parameters: Iterable[np.ndarray] | None,
         total_timesteps: int,
+        wand_run: wandb.sdk.wandb_run.Run | None,
         **learn_kwargs: Any,
     ) -> tuple[list[np.ndarray], float, dict[str, Any]]:
         """
@@ -78,7 +95,7 @@ class FederatedDQNClient:
         if parameters is not None:
             self.set_parameters(parameters)
 
-        metrics = self.train(total_timesteps, **learn_kwargs)
+        metrics = self.train(total_timesteps, wand_run, **learn_kwargs)
         return self.get_parameters(), self.aggregation_weight, metrics
 
 

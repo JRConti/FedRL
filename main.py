@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 import gymnasium as gym
+from datetime import datetime
 
 from client import FederatedDQNClient
 from server import FederatedDQNServer
@@ -82,15 +83,26 @@ def make_model(env_id: str,
         )
 
 
-def build_server(args: argparse.Namespace, wand_run: wandb.sdk.wandb_run.Run | None) -> FederatedDQNServer:
+def build_server(args: argparse.Namespace, project_id: str, client_id_list: list[str]) -> FederatedDQNServer:
     clients = []
-    for client_id in range(args.num_clients):
-        client_seed = args.seed + client_id
-        if client_id == 0:
-            model = make_model(args.env_id, client_seed, args, wand_run)
-        else:
-            model = make_model(args.env_id, client_seed, args, None)
-        clients.append(FederatedDQNClient(client_id=client_id, model=model))
+    config = {
+        "policy_type": "DQN",
+        "env_name": args.env_id,
+        "total_timesteps": (args.timesteps_per_round)
+    }
+    for i in range(args.num_clients):
+        client_seed = args.seed + i
+        run = wandb.init(
+            project=project_id,
+            id = client_id_list[i],
+            config=config,
+            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+            #monitor_gym=True,  # auto-upload the videos of agents playing the game
+            #save_code=True,  # optional
+        )
+        model = make_model(args.env_id, client_seed, args, run)
+        clients.append(FederatedDQNClient(client_id=client_id_list[i], model=model, env_id=args.env_id))
+        run.finish()
     return FederatedDQNServer(clients)
 
 
@@ -143,30 +155,33 @@ def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Nam
 
 def main() -> None:
     args = parse_args()
-    config = {
-        "policy_type": "DQN",
-        "env_name": args.env_id,
-        "total_timesteps": (args.timesteps_per_round * args.num_rounds)
-    }
-    run = wandb.init(
-        project="FedRL-sb3",
-        config=config,
-        sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
-        #monitor_gym=True,  # auto-upload the videos of agents playing the game
-        #save_code=True,  # optional
-    )
-    server = build_server(args, run)
+    project_id = str(datetime.now()).split(".")[0].replace(" ","-").replace(":","")
+    client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
+    server = build_server(args, project_id, client_id_list)
 
     history = []
-    for _ in range(args.num_rounds):
-        round_metrics = server.train_round(args.timesteps_per_round, run)
+    for i in range(args.num_rounds):
+        round_metrics = server.train_round(args.timesteps_per_round, client_id_list)
         history.append(round_metrics)
         print(
             f"Round {round_metrics['round']}/{args.num_rounds} "
             f"completed with {round_metrics['num_clients']} clients."
         )
 
-    mean_reward, std_reward = evaluate_global_model(server, args, run)
+    config = {
+        "policy_type": "DQN",
+        "env_name": args.env_id,
+        "total_timesteps": (args.num_rounds)
+    }
+    server_run = wandb.init(
+        project=project_id,
+        id = project_id + "-server",
+        config=config,
+        sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+        #monitor_gym=True,  # auto-upload the videos of agents playing the game
+        #save_code=True,  # optional
+        )
+    mean_reward, std_reward = evaluate_global_model(server, args, server_run)
     final_eval = {
         "mean_reward": mean_reward,
         "std_reward": std_reward,
@@ -185,7 +200,7 @@ def main() -> None:
         save_global_model(args.save_model, server, args)
         print(f"Saved final global model to {args.save_model}")
         
-    run.finish()
+    server_run.finish()
 
 if __name__ == "__main__":
     main()

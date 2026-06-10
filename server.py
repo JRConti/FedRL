@@ -23,7 +23,7 @@ class FederatedDQNServer:
 
     def train_round(self,
                     total_timesteps: int,
-                    wand_run: wandb.sdk.wandb_run.Run | None,
+                    wand_run_id_list: list[str | None],
                     **learn_kwargs: Any) -> dict[str, Any]:
         """Run one federated round over all clients."""
         client_results = []
@@ -32,7 +32,7 @@ class FederatedDQNServer:
             parameters, weight, metrics = client.fit(
                 self.global_parameters,
                 total_timesteps,
-                wand_run,
+                client.client_id,
                 **learn_kwargs,
             )
             client_results.append((parameters, weight, metrics))
@@ -54,14 +54,14 @@ class FederatedDQNServer:
         self,
         num_rounds: int,
         total_timesteps_per_round: int,
-        wand_run: wandb.sdk.wandb_run.Run | None,
+        wand_run_id: str | None,
         **learn_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Run several federated rounds."""
         history = []
         for _ in range(num_rounds):
             history.append(self.train_round(total_timesteps_per_round,
-                                            wand_run,
+                                            wand_run_id,
                                             **learn_kwargs))
         return history
 

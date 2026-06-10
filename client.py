@@ -20,29 +20,31 @@ class FederatedDQNClient:
         self,
         client_id: str | int,
         model: DQN,
+        env_id: str,
         aggregation_weight: float = 1.0,
         sync_target_network: bool = True,
     ) -> None:
         self.client_id = client_id
+        self.env_id = env_id
         self.model = model
         self.aggregation_weight = aggregation_weight
         self.sync_target_network = sync_target_network
 
     def train(self,
               total_timesteps: int,
-              wand_run: wandb.sdk.wandb_run.Run | None,
+              wand_run_id: str | None,
               **learn_kwargs: Any) -> dict[str, Any]:
         """Train the local DQN model for one federated round."""
         learn_kwargs.setdefault("reset_num_timesteps", False)
         timesteps_before = self.model.num_timesteps
 
-        if wand_run is None:
+        if wand_run_id is None:
             self.model.learn(total_timesteps=total_timesteps,
                              **learn_kwargs)
         else:
             wandCallBack=WandbCallback(
                 gradient_save_freq=100,
-                model_save_path=f"models/{wand_run.id}",
+                model_save_path=f"models/{wand_run_id}",
                 verbose=2,
             )
             self.model.learn(total_timesteps=total_timesteps,
@@ -85,7 +87,7 @@ class FederatedDQNClient:
         self,
         parameters: Iterable[np.ndarray] | None,
         total_timesteps: int,
-        wand_run: wandb.sdk.wandb_run.Run | None,
+        wand_run_id: str | None,
         **learn_kwargs: Any,
     ) -> tuple[list[np.ndarray], float, dict[str, Any]]:
         """
@@ -94,8 +96,20 @@ class FederatedDQNClient:
         """
         if parameters is not None:
             self.set_parameters(parameters)
-
-        metrics = self.train(total_timesteps, wand_run, **learn_kwargs)
+        project_id = wand_run_id[:wand_run_id.rindex("-")]
+        config = config = {
+                                "policy_type": "DQN",
+                                "env_name": self.env_id,
+                                "total_timesteps": (total_timesteps)
+                            }
+        run = wandb.init(
+                    project=project_id,
+                    id = wand_run_id,
+                    config=config,
+                    sync_tensorboard=True,
+                    resume = "must")
+        metrics = self.train(total_timesteps, wand_run_id, **learn_kwargs)
+        run.finish()
         return self.get_parameters(), self.aggregation_weight, metrics
 
 

@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-size", type=int, default=50_000, help="DQN replay buffer size.")
     parser.add_argument("--batch-size", type=int, default=32, help="DQN batch size.")
     parser.add_argument("--verbose", type=int, default=0, help="Stable-Baselines3 verbosity.")
+    parser.add_argument("--parallel", type=bool, default=False, help="Calculate experiements in series or parallel.")
     parser.add_argument(
         "--save-model",
         type=Path,
@@ -92,17 +93,24 @@ def build_server(args: argparse.Namespace, project_id: str, client_id_list: list
     }
     for i in range(args.num_clients):
         client_seed = args.seed + i
-        run = wandb.init(
-            project=project_id,
-            id = client_id_list[i],
-            config=config,
-            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
-            #monitor_gym=True,  # auto-upload the videos of agents playing the game
-            #save_code=True,  # optional
-        )
-        model = make_model(args.env_id, client_seed, args, run)
-        clients.append(FederatedDQNClient(client_id=client_id_list[i], model=model, env_id=args.env_id))
-        run.finish()
+        if args.parallel and (i > 0):
+            model = make_model(args.env_id, client_seed, args, None)
+            clients.append(FederatedDQNClient(client_id=client_id_list[i],
+                                              model=model,
+                                              env_id=args.env_id))
+        else:
+            run = wandb.init(
+                project=project_id,
+                id = client_id_list[i],
+                config=config,
+                sync_tensorboard=True,
+            )
+            model = make_model(args.env_id, client_seed, args, run)
+            clients.append(FederatedDQNClient(client_id=client_id_list[i],
+                                              model=model,
+                                              env_id=args.env_id))
+            run.finish()
+        
     return FederatedDQNServer(clients)
 
 
@@ -156,18 +164,58 @@ def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Nam
 def main() -> None:
     args = parse_args()
     project_id = str(datetime.now()).split(".")[0].replace(" ","-").replace(":","")
-    client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
+    if args.parallel and (args.num_clients > 1):
+        client_id_list = [project_id + "-" + str(0)] + [None]*(args.num_clients-1)
+    else:
+        client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
     server = build_server(args, project_id, client_id_list)
-
     history = []
     for i in range(args.num_rounds):
-        round_metrics = server.train_round(args.timesteps_per_round, client_id_list)
+        round_metrics = server.train_round(args.timesteps_per_round,
+                                           client_id_list)
         history.append(round_metrics)
         print(
             f"Round {round_metrics['round']}/{args.num_rounds} "
             f"completed with {round_metrics['num_clients']} clients."
         )
+    print(history)
+    #Add custom table with aggregated values.
+    column_list = ["round", "agent","total_timesteps", "mean_reward"]
 
+    data = [[] for j in range(args.num_clients)]
+    for i in range(len(history)):
+        for j in range(len(history[i]["client_metrics"])):
+            data[j].append([i,
+                         j,
+                         history[i]["client_metrics"][j]["total_timesteps"],
+                         history[i]["client_metrics"][j]["mean_reward"]])
+    print(data)
+    for j in range(args.num_clients):
+        config = {
+            "policy_type": "DQN",
+            "env_name": args.env_id,
+            "total_timesteps": (args.timesteps_per_round)
+        }
+        if j ==0:
+            run = wandb.init(
+                project=project_id,
+                id = project_id + "-" + str(j),
+                config=config,
+                sync_tensorboard=True,
+                resume = "must",
+            )
+        else:
+            run = wandb.init(
+                project=project_id,
+                id = project_id + "-" + str(j),
+                config=config,
+                sync_tensorboard=True,
+            )
+        table = wandb.Table(data=data[j], columns = column_list)
+        run.log({"my_lineplot_id" : wandb.plot.line(table, "total_timesteps", 
+                   "mean_reward", title="Mean Reward by Timestep")})
+        run.finish()
+    
     config = {
         "policy_type": "DQN",
         "env_name": args.env_id,
@@ -177,9 +225,7 @@ def main() -> None:
         project=project_id,
         id = project_id + "-server",
         config=config,
-        sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
-        #monitor_gym=True,  # auto-upload the videos of agents playing the game
-        #save_code=True,  # optional
+        sync_tensorboard=True,
         )
     mean_reward, std_reward = evaluate_global_model(server, args, server_run)
     final_eval = {
@@ -199,7 +245,17 @@ def main() -> None:
     if args.save_model is not None:
         save_global_model(args.save_model, server, args)
         print(f"Saved final global model to {args.save_model}")
-        
+    '''
+    #Add custom table with aggregated values.
+    column_list = ["round", "agent","total_timesteps", "mean_reward"]
+    data = []
+    for i in range(len(history)):
+        for j in range(len(history[i]["client_metrics"])):
+            data.append([i,j, history[i]["client_metrics"][j]["total_timesteps"], history[i]["client_metrics"][j]["mean_reward"]])
+    table = wandb.Table(data=data, columns = column_list)
+    server_run.log({"my_lineplot_id" : wandb.plot.line(table, "total_timesteps", 
+               "mean_reward", stroke=None, title="Mean Reward by Timestep")})
+    '''
     server_run.finish()
 
 if __name__ == "__main__":

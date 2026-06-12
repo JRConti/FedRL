@@ -23,16 +23,23 @@ class FederatedDQNServer:
 
     def train_round(self,
                     total_timesteps: int,
-                    wand_run_id_list: list[str | None],
+                    real_time_communication: bool,
                     **learn_kwargs: Any) -> dict[str, Any]:
         """Run one federated round over all clients."""
         client_results = []
         
         for client in self.clients:
+            #Check if we want to monitor the training in real time.
+            #Note that this has costly connection steps and is incompatible with parallel processing.
+            if real_time_communication:
+                client_id_val = client.client_id
+            else:
+                client_id_val = None
+            
             parameters, weight, metrics = client.fit(
                 self.global_parameters,
                 total_timesteps,
-                client.client_id,
+                client_id_val,
                 **learn_kwargs,
             )
             client_results.append((parameters, weight, metrics))
@@ -49,6 +56,7 @@ class FederatedDQNServer:
             "num_clients": len(self.clients),
             "client_metrics": [metrics for _, _, metrics in client_results],
         }
+    
 
     def train(
         self,

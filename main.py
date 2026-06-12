@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32, help="DQN batch size.")
     parser.add_argument("--verbose", type=int, default=0, help="Stable-Baselines3 verbosity.")
     parser.add_argument("--parallel", type=bool, default=False, help="Calculate experiements in series or parallel.")
+    parser.add_argument("--real_time_communication", type=bool, default=False, help="Communicate wandb results in real time.")
     parser.add_argument(
         "--save-model",
         type=Path,
@@ -83,34 +84,48 @@ def make_model(env_id: str,
             tensorboard_log=f"runs/{wand_run.id}",
         )
 
-
-def build_server(args: argparse.Namespace, project_id: str, client_id_list: list[str]) -> FederatedDQNServer:
-    clients = []
+def initialize_wandb(args: argparse.Namespace, project_id: str | None, client_id: str | None, resume: bool, total_timesteps: int):
     config = {
         "policy_type": "DQN",
         "env_name": args.env_id,
-        "total_timesteps": (args.timesteps_per_round)
+        "total_timesteps": total_timesteps
     }
+    #If we are reopening an exiting connection, we must specify this in the initialization parameters
+    if resume:
+        resume_val = "must"
+    else:
+        resume_val = None
+    run = wandb.init(
+            project=project_id,
+            id = client_id,
+            config=config,
+            sync_tensorboard=True,
+            resume=resume_val,
+        )
+    return(run)
+
+def build_server(args: argparse.Namespace, project_id: str, client_id_list: list[str]) -> FederatedDQNServer:
+    clients = []
     for i in range(args.num_clients):
         client_seed = args.seed + i
-        if args.parallel and (i > 0):
+        '''
+        #Here, we do real time communication for only one client unless otherwise specified.
+        if (args.parallel and i > 0) or (not args.real_time_communication):
             model = make_model(args.env_id, client_seed, args, None)
             clients.append(FederatedDQNClient(client_id=client_id_list[i],
+                                              project_id=project_id,
                                               model=model,
                                               env_id=args.env_id))
         else:
-            run = wandb.init(
-                project=project_id,
-                id = client_id_list[i],
-                config=config,
-                sync_tensorboard=True,
-            )
-            model = make_model(args.env_id, client_seed, args, run)
-            clients.append(FederatedDQNClient(client_id=client_id_list[i],
-                                              model=model,
-                                              env_id=args.env_id))
-            run.finish()
-        
+        '''
+        run = initialize_wandb(args, project_id, client_id_list[i], False, args.timesteps_per_round)
+        model = make_model(args.env_id, client_seed, args, run)
+        client = FederatedDQNClient(client_id=client_id_list[i],
+                                          project_id=project_id,
+                                          model=model,
+                                          env_id=args.env_id)
+        clients.append(client)
+        run.finish()
     return FederatedDQNServer(clients)
 
 
@@ -160,73 +175,61 @@ def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Nam
     load_global_parameters(model, server.global_parameters)
     model.save(path)
 
+def push_timestep_data(run: wandb.sdk.wandb_run.Run,
+                       data: list[list],
+                       column_list: list, 
+                       title: str,
+                       x_var: str,
+                       y_var: str):
+    
+    table = wandb.Table(data=data, columns=column_list)
+    run.log({title : wandb.plot.line(table, x_var, y_var, title=title)})
 
 def main() -> None:
     args = parse_args()
     project_id = str(datetime.now()).split(".")[0].replace(" ","-").replace(":","")
-    if args.parallel and (args.num_clients > 1):
-        client_id_list = [project_id + "-" + str(0)] + [None]*(args.num_clients-1)
-    else:
-        client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
+    client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
     server = build_server(args, project_id, client_id_list)
     history = []
+    data = [[] for i in range(args.num_rounds)]
+
     for i in range(args.num_rounds):
         round_metrics = server.train_round(args.timesteps_per_round,
-                                           client_id_list)
+                                           args.real_time_communication)
         history.append(round_metrics)
         print(
             f"Round {round_metrics['round']}/{args.num_rounds} "
             f"completed with {round_metrics['num_clients']} clients."
         )
-    print(history)
-    #Add custom table with aggregated values.
-    column_list = ["round", "agent","total_timesteps", "mean_reward"]
-
-    data = [[] for j in range(args.num_clients)]
-    for i in range(len(history)):
-        for j in range(len(history[i]["client_metrics"])):
+        for j in range(len(round_metrics["client_metrics"])):
             data[j].append([i,
                          j,
-                         history[i]["client_metrics"][j]["total_timesteps"],
-                         history[i]["client_metrics"][j]["mean_reward"]])
-    print(data)
-    for j in range(args.num_clients):
-        config = {
-            "policy_type": "DQN",
-            "env_name": args.env_id,
-            "total_timesteps": (args.timesteps_per_round)
-        }
-        if j ==0:
-            run = wandb.init(
-                project=project_id,
-                id = project_id + "-" + str(j),
-                config=config,
-                sync_tensorboard=True,
-                resume = "must",
-            )
-        else:
-            run = wandb.init(
-                project=project_id,
-                id = project_id + "-" + str(j),
-                config=config,
-                sync_tensorboard=True,
-            )
-        table = wandb.Table(data=data[j], columns = column_list)
-        run.log({"my_lineplot_id" : wandb.plot.line(table, "total_timesteps", 
-                   "mean_reward", title="Mean Reward by Timestep")})
-        run.finish()
-    
-    config = {
-        "policy_type": "DQN",
-        "env_name": args.env_id,
-        "total_timesteps": (args.num_rounds)
-    }
-    server_run = wandb.init(
-        project=project_id,
-        id = project_id + "-server",
-        config=config,
-        sync_tensorboard=True,
-        )
+                         round_metrics["client_metrics"][j]["total_timesteps"],
+                         round_metrics["client_metrics"][j]["mean_reward"]])
+            #Pushing this rounds data.
+            title = "Mean Reward by Timestep"
+            column_list = ["round", "agent","total_timesteps", "mean_reward"]
+            run = initialize_wandb(args,
+                                   project_id,
+                                   client_id_list[j],
+                                   True,
+                                   args.timesteps_per_round)
+            #Push our mean reward table
+            #We can also push some other data now that the connection is open.
+            push_timestep_data(run,
+                           data=data[j],
+                           column_list=column_list, 
+                           title=title,
+                           x_var="total_timesteps",
+                           y_var="mean_reward")
+            run.finish()
+
+
+    server_run = initialize_wandb(args=args,
+                                 project_id=project_id,
+                                 client_id=project_id + "-server",
+                                 resume=False,
+                                 total_timesteps=args.num_rounds)
     mean_reward, std_reward = evaluate_global_model(server, args, server_run)
     final_eval = {
         "mean_reward": mean_reward,
@@ -245,17 +248,6 @@ def main() -> None:
     if args.save_model is not None:
         save_global_model(args.save_model, server, args)
         print(f"Saved final global model to {args.save_model}")
-    '''
-    #Add custom table with aggregated values.
-    column_list = ["round", "agent","total_timesteps", "mean_reward"]
-    data = []
-    for i in range(len(history)):
-        for j in range(len(history[i]["client_metrics"])):
-            data.append([i,j, history[i]["client_metrics"][j]["total_timesteps"], history[i]["client_metrics"][j]["mean_reward"]])
-    table = wandb.Table(data=data, columns = column_list)
-    server_run.log({"my_lineplot_id" : wandb.plot.line(table, "total_timesteps", 
-               "mean_reward", stroke=None, title="Mean Reward by Timestep")})
-    '''
     server_run.finish()
 
 if __name__ == "__main__":

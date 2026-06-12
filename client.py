@@ -20,12 +20,14 @@ class FederatedDQNClient:
     def __init__(
         self,
         client_id: str | int,
+        project_id: str | int,
         model: DQN,
         env_id: str,
         aggregation_weight: float = 1.0,
         sync_target_network: bool = True,
     ) -> None:
         self.client_id = client_id
+        self.project_id = project_id
         self.env_id = env_id
         self.model = model
         self.aggregation_weight = aggregation_weight
@@ -43,6 +45,12 @@ class FederatedDQNClient:
             self.model.learn(total_timesteps=total_timesteps,
                              **learn_kwargs)
         else:
+            config = {
+                "policy_type": "DQN",
+                "env_name": self.env_id,
+                "total_timesteps": (total_timesteps)
+            }
+            run = self.reinitialize_wandb(wand_run_id, config)
             wandCallBack=WandbCallback(
                 gradient_save_freq=100,
                 model_save_path=f"models/{wand_run_id}",
@@ -51,6 +59,7 @@ class FederatedDQNClient:
             self.model.learn(total_timesteps=total_timesteps,
                              callback=wandCallBack,
                              **learn_kwargs)
+            run.finish()
         trained_timesteps = self.model.num_timesteps - timesteps_before
         mean_reward, std_reward = evaluate_policy(self.model,
                         self.model.get_env(),
@@ -91,6 +100,15 @@ class FederatedDQNClient:
         if self.sync_target_network:
             self.model.q_net_target.load_state_dict(state_dict)
 
+    def reinitialize_wandb(self, wand_run_id: str, config: dict):
+        run = wandb.init(
+                        project=self.project_id,
+                        id = wand_run_id,
+                        config=config,
+                        sync_tensorboard=True,
+                        resume = "must")
+        return run
+        
     def fit(
         self,
         parameters: Iterable[np.ndarray] | None,
@@ -106,22 +124,9 @@ class FederatedDQNClient:
             self.set_parameters(parameters)
 
         if wand_run_id is None:
-            metrics = self.train(total_timesteps, wand_run_id, **learn_kwargs)
+            metrics = self.train(total_timesteps, None, **learn_kwargs)
         else:
-            config = config = {
-                                    "policy_type": "DQN",
-                                    "env_name": self.env_id,
-                                    "total_timesteps": (total_timesteps)
-                                }
-            project_id = wand_run_id[:wand_run_id.rindex("-")]
-            run = wandb.init(
-                        project=project_id,
-                        id = wand_run_id,
-                        config=config,
-                        sync_tensorboard=True,
-                        resume = "must")
             metrics = self.train(total_timesteps, wand_run_id, **learn_kwargs)
-            run.finish()
         return self.get_parameters(), self.aggregation_weight, metrics
 
 

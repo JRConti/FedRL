@@ -85,6 +85,10 @@ def make_model(env_id: str,
         )
 
 def initialize_wandb(args: argparse.Namespace, project_id: str | None, client_id: str | None, resume: bool, total_timesteps: int):
+    #here is a basic function that initializes a wandb connection.
+    #If this is a reinitialization of an existing connection, we must set resume=True.
+    #The reason is that wandb throws an error if you set resume="must" for the first connection.
+    #But it is obligatory for all subsequent connections.
     config = {
         "policy_type": "DQN",
         "env_name": args.env_id,
@@ -106,18 +110,12 @@ def initialize_wandb(args: argparse.Namespace, project_id: str | None, client_id
 
 def build_server(args: argparse.Namespace, project_id: str, client_id_list: list[str]) -> FederatedDQNServer:
     clients = []
+    #We build our server.
+    #The key addition step is that each client must have its wandb run associated with it from its creation.
+    #Thus, we intitialize a run for each of these clients and close it as well.
+    #This is because having multiple open connections for the same project results in errors.
     for i in range(args.num_clients):
         client_seed = args.seed + i
-        '''
-        #Here, we do real time communication for only one client unless otherwise specified.
-        if (args.parallel and i > 0) or (not args.real_time_communication):
-            model = make_model(args.env_id, client_seed, args, None)
-            clients.append(FederatedDQNClient(client_id=client_id_list[i],
-                                              project_id=project_id,
-                                              model=model,
-                                              env_id=args.env_id))
-        else:
-        '''
         run = initialize_wandb(args, project_id, client_id_list[i], False, args.timesteps_per_round)
         model = make_model(args.env_id, client_seed, args, run)
         client = FederatedDQNClient(client_id=client_id_list[i],
@@ -171,7 +169,7 @@ def write_history(path: Path, history: list[dict[str, Any]], final_eval: dict[st
 
 def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Namespace) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    model = make_model(args.env_id, args.seed + 20_000, args)
+    model = make_model(args.env_id, args.seed + 20_000, args, None)
     load_global_parameters(model, server.global_parameters)
     model.save(path)
 
@@ -187,12 +185,20 @@ def push_timestep_data(run: wandb.sdk.wandb_run.Run,
 
 def main() -> None:
     args = parse_args()
+    #Here we create unique keys for the project based on the current datetime.
+    #We do the same for each client, then build our sever.
     project_id = str(datetime.now()).split(".")[0].replace(" ","-").replace(":","")
     client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
     server = build_server(args, project_id, client_id_list)
+
+    #We now run our main loop.
+    #We save the metrics for loggin purposes and also extract them as lists
+    #in our data object which will be saved as a wandb table.
+    #After each training round, we push our tables so that the reward
+    #progress can be monitored as close to real time as possible.
+    #This could probably be done incrementally.  To improve.
     history = []
     data = [[] for i in range(args.num_rounds)]
-
     for i in range(args.num_rounds):
         round_metrics = server.train_round(args.timesteps_per_round,
                                            args.real_time_communication)
@@ -224,7 +230,8 @@ def main() -> None:
                            y_var="mean_reward")
             run.finish()
 
-
+    #We now intialize a server wandb connection.
+    #The current status is we are saving the global metrics but will expand on this.
     server_run = initialize_wandb(args=args,
                                  project_id=project_id,
                                  client_id=project_id + "-server",

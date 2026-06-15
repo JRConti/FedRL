@@ -12,7 +12,7 @@ from stable_baselines3 import DQN
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 import wandb
-
+from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a federated DQN with FedAvg.")
@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", type=int, default=0, help="Stable-Baselines3 verbosity.")
     parser.add_argument("--parallel", type=bool, default=False, help="Calculate experiements in series or parallel.")
     parser.add_argument("--real_time_communication", type=bool, default=False, help="Communicate wandb results in real time.")
+    parser.add_argument("--video_step_length", type=int, default=0, help="Number of timesteps in saved video.  0 means no video is saved.")
     parser.add_argument(
         "--save-model",
         type=Path,
@@ -55,7 +56,11 @@ def make_env(env_id: str, seed: int) -> gym.Env:
     env.observation_space.seed(seed)
     return Monitor(env)
 
-
+def make_video_env() -> gym.Env:
+    env_id = 'CartPole-v1'
+    env = gym.make(env_id,  render_mode = 'rgb_array')
+    return env
+    
 def make_model(env_id: str,
                seed: int,
                args: argparse.Namespace,
@@ -71,7 +76,6 @@ def make_model(env_id: str,
             batch_size=args.batch_size,
             verbose=args.verbose,
         )
-
     else:
         return DQN(
             "MlpPolicy",
@@ -173,6 +177,24 @@ def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Nam
     load_global_parameters(model, server.global_parameters)
     model.save(path)
 
+def save_video(path: Path, parameters: list[np.ndarray], args: argparse.Namespace) -> None:
+    #Here we save our server video.  Can be adapted to clients if necessary.
+    env = DummyVecEnv([make_video_env])
+    env = VecVideoRecorder(
+        env,
+        path,
+        record_video_trigger=lambda x: x == 0,
+        video_length=args.video_step_length,
+    )
+    model = DQN("MlpPolicy", env, verbose=1)
+    load_global_parameters(model, parameters)
+
+    obs = env.reset()
+    for _ in range(args.video_step_length):
+        action, _states = model.predict(obs)
+        obs, rewards, dones, info = env.step(action)
+        env.render()
+
 def push_timestep_data(run: wandb.sdk.wandb_run.Run,
                        data: list[list],
                        column_list: list, 
@@ -255,6 +277,12 @@ def main() -> None:
     if args.save_model is not None:
         save_global_model(args.save_model, server, args)
         print(f"Saved final global model to {args.save_model}")
+
+    if args.video_step_length > 0:
+        parameters = server.global_parameters
+        save_video(path=f"videos/{project_id}",
+                            parameters=parameters,
+                            args=args)
     server_run.finish()
 
 if __name__ == "__main__":

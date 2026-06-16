@@ -219,7 +219,10 @@ def main() -> None:
     #After each training round, we push our tables so that the reward
     #progress can be monitored as close to real time as possible.
     #This could probably be done incrementally.  To improve.
+    column_list = ["round", "agent","total_timesteps", "mean_reward"]
+    title = "Mean Reward by Timestep"
     history = []
+    server_data = []
     data = [[] for i in range(args.num_rounds)]
     for i in range(args.num_rounds):
         round_metrics = server.train_round(args.timesteps_per_round,
@@ -229,14 +232,32 @@ def main() -> None:
             f"Round {round_metrics['round']}/{args.num_rounds} "
             f"completed with {round_metrics['num_clients']} clients."
         )
+        #Now we post the server model statistics.
+        resume_val = (i>0)
+        server_run = initialize_wandb(args=args,
+                                     project_id=project_id,
+                                     client_id=project_id + "-server",
+                                     resume=resume_val,
+                                     total_timesteps=(i+1)*args.timesteps_per_round)
+        mean_reward, std_reward = evaluate_global_model(server, args, server_run)
+        server_data.append([i,
+                             "server",
+                             (i+1)*args.timesteps_per_round,
+                             mean_reward])
+
+        push_timestep_data(server_run,
+                                   data=server_data,
+                                   column_list=column_list,
+                                   title=title,
+                                   x_var="total_timesteps",
+                                   y_var="mean_reward")
+        server_run.finish()
         for j in range(len(round_metrics["client_metrics"])):
             data[j].append([i,
                          j,
                          round_metrics["client_metrics"][j]["total_timesteps"],
                          round_metrics["client_metrics"][j]["mean_reward"]])
             #Pushing this rounds data.
-            title = "Mean Reward by Timestep"
-            column_list = ["round", "agent","total_timesteps", "mean_reward"]
             run = initialize_wandb(args,
                                    project_id,
                                    client_id_list[j],
@@ -246,18 +267,18 @@ def main() -> None:
             #We can also push some other data now that the connection is open.
             push_timestep_data(run,
                            data=data[j],
-                           column_list=column_list, 
+                           column_list=column_list,
                            title=title,
                            x_var="total_timesteps",
                            y_var="mean_reward")
             run.finish()
-
+            
     #We now intialize a server wandb connection.
     #The current status is we are saving the global metrics but will expand on this.
     server_run = initialize_wandb(args=args,
                                  project_id=project_id,
                                  client_id=project_id + "-server",
-                                 resume=False,
+                                 resume=True,
                                  total_timesteps=args.num_rounds)
     mean_reward, std_reward = evaluate_global_model(server, args, server_run)
     final_eval = {

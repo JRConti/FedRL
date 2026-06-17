@@ -35,7 +35,6 @@ class FederatedDQNServer:
                 client_id_val = client.client_id
             else:
                 client_id_val = None
-            
             parameters, weight, metrics = client.fit(
                 self.global_parameters,
                 total_timesteps,

@@ -272,6 +272,8 @@ def main() -> None:
                            x_var="total_timesteps",
                            y_var="mean_reward")
             run.finish()
+        #Broadcast the parameters to each client.
+        server.broadcast(server.global_parameters)
             
     #We now intialize a server wandb connection.
     #The current status is we are saving the global metrics but will expand on this.

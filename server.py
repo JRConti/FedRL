@@ -48,7 +48,8 @@ class FederatedDQNServer:
             [parameters for parameters, _, _ in client_results],
             [weight for _, weight, _ in client_results],
         )
-        self.broadcast(self.global_parameters)
+        #We separate the broadcast step so that we can 
+        #self.broadcast(self.global_parameters)
         self.round += 1
 
         return {

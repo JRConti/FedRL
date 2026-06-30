@@ -12,11 +12,18 @@ from server import FederatedDQNServer
 from stable_baselines3 import DQN
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
-import wandb
 from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
+from wandb_logging import (
+    finish_wandb_runs,
+    initialize_training_wandb,
+    log_centralized_metrics,
+    log_round_metrics,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a federated DQN with FedAvg.")
+    parser.add_argument("--algo", default="DQN", help="RL algorithm to use.")
     parser.add_argument("--env-id", default="CartPole-v1", help="Gymnasium environment id.")
     parser.add_argument("--num-clients", type=int, default=2, help="Number of federated clients.")
     parser.add_argument("--num-rounds", type=int, default=10, help="Number of federated rounds.")
@@ -32,9 +39,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-size", type=int, default=50_000, help="DQN replay buffer size.")
     parser.add_argument("--batch-size", type=int, default=32, help="DQN batch size.")
     parser.add_argument("--verbose", type=int, default=0, help="Stable-Baselines3 verbosity.")
-    parser.add_argument("--parallel", type=bool, default=False, help="Calculate experiements in series or parallel.")
-    parser.add_argument("--real_time_communication", type=bool, default=False, help="Communicate wandb results in real time.")
-    parser.add_argument("--video_step_length", type=int, default=0, help="Number of timesteps in saved video.  0 means no video is saved.")
+    parser.add_argument(
+        "--video-step-length",
+        "--video_step_length",
+        dest="video_step_length",
+        type=int,
+        default=0,
+        help="Number of timesteps in saved video. 0 means no video is saved.",
+    )
     parser.add_argument(
         "--save-model",
         type=Path,
@@ -57,85 +69,53 @@ def make_env(env_id: str, seed: int) -> gym.Env:
     env.observation_space.seed(seed)
     return Monitor(env)
 
-def make_video_env() -> gym.Env:
-    env_id = 'CartPole-v1'
-    env = gym.make(env_id,  render_mode = 'rgb_array')
+def make_video_env(env_id: str) -> gym.Env:
+    env = gym.make(env_id, render_mode="rgb_array")
     return env
     
-def make_model(env_id: str,
-               seed: int,
-               args: argparse.Namespace,
-               wand_run: wandb.sdk.wandb_run.Run | None) -> DQN:
+def make_model(
+    env_id: str,
+    seed: int,
+    args: argparse.Namespace,
+    tensorboard_log: str | None = None,
+) -> DQN:
     env = make_env(env_id, seed)
-    if wand_run is None:
-        return DQN(
-            "MlpPolicy",
-            env,
-            seed=seed,
-            learning_starts=args.learning_starts,
-            buffer_size=args.buffer_size,
-            batch_size=args.batch_size,
-            verbose=args.verbose,
-        )
-    else:
-        return DQN(
-            "MlpPolicy",
-            env,
-            seed=seed,
-            learning_starts=args.learning_starts,
-            buffer_size=args.buffer_size,
-            batch_size=args.batch_size,
-            verbose=args.verbose,
-            tensorboard_log=f"runs/{wand_run.id}",
-        )
+    return DQN(
+        "MlpPolicy",
+        env,
+        seed=seed,
+        learning_starts=args.learning_starts,
+        buffer_size=args.buffer_size,
+        batch_size=args.batch_size,
+        verbose=args.verbose,
+        tensorboard_log=tensorboard_log,
+    )
 
-def initialize_wandb(args: argparse.Namespace, project_id: str | None, client_id: str | None, resume: bool, total_timesteps: int):
-    #here is a basic function that initializes a wandb connection.
-    #If this is a reinitialization of an existing connection, we must set resume=True.
-    #The reason is that wandb throws an error if you set resume="must" for the first connection.
-    #But it is obligatory for all subsequent connections.
-    config = {
-        "policy_type": "DQN",
-        "env_name": args.env_id,
-        "total_timesteps": total_timesteps
-    }
-    #If we are reopening an exiting connection, we must specify this in the initialization parameters
-    if resume:
-        resume_val = "must"
-    else:
-        resume_val = None
-    run = wandb.init(
-            project=project_id,
-            id = client_id,
-            config=config,
-            sync_tensorboard=True,
-            resume=resume_val,
-        )
-    return(run)
 
-def build_server(args: argparse.Namespace, project_id: str, client_id_list: list[str]) -> FederatedDQNServer:
+def build_server(
+    args: argparse.Namespace,
+    experiment_id: str,
+    client_id_list: list[str],
+    client_sb3_runs: dict[str, Any] | None = None,
+) -> FederatedDQNServer:
     clients = []
-    #We build our server.
-    #The key addition step is that each client must have its wandb run associated with it from its creation.
-    #Thus, we intitialize a run for each of these clients and close it as well.
-    #This is because having multiple open connections for the same project results in errors.
     for i in range(args.num_clients):
         client_seed = args.seed + i
-        run = initialize_wandb(args, project_id, client_id_list[i], False, args.timesteps_per_round)
-        model = make_model(args.env_id, client_seed, args, run)
-        client = FederatedDQNClient(client_id=client_id_list[i],
-                                          project_id=project_id,
-                                          model=model,
-                                          env_id=args.env_id)
+        client_id = client_id_list[i]
+        model = make_model(
+            args.env_id,
+            client_seed,
+            args,
+        )
+        client = FederatedDQNClient(
+            client_id=client_id,
+            project_id=experiment_id,
+            model=model,
+            native_wandb_run=(
+                None if client_sb3_runs is None else client_sb3_runs.get(client_id)
+            ),
+        )
         clients.append(client)
-        run.finish()
-    #We also initialize the server run so that we can avoid worrying about resume values.
-    server_run = initialize_wandb(args=args,
-                             project_id=project_id,
-                             client_id=project_id + "-server",
-                             resume=False,
-                             total_timesteps=args.num_rounds)
-    server_run.finish()
     return FederatedDQNServer(clients)
 
 
@@ -154,20 +134,37 @@ def load_global_parameters(model: DQN, parameters: list[np.ndarray]) -> None:
 def evaluate_global_model(
     server: FederatedDQNServer,
     args: argparse.Namespace,
-    wand_run: wandb.sdk.wandb_run.Run | None,
 ) -> tuple[float, float]:
-    eval_model = make_model(args.env_id,
-                            args.seed + 10_000,
-                            args,
-                            wand_run)
-    load_global_parameters(eval_model, server.global_parameters)
-    mean_reward, std_reward = evaluate_policy(
-        eval_model,
-        eval_model.get_env(),
-        n_eval_episodes=args.eval_episodes,
-        deterministic=True,
-    )
-    return float(mean_reward), float(std_reward)
+    eval_model = make_model(args.env_id, args.seed + 10_000, args)
+    try:
+        load_global_parameters(eval_model, server.global_parameters)
+        mean_reward, std_reward = evaluate_policy(
+            eval_model,
+            eval_model.get_env(),
+            n_eval_episodes=args.eval_episodes,
+            deterministic=True,
+        )
+        return float(mean_reward), float(std_reward)
+    finally:
+        eval_model.get_env().close()
+
+
+def evaluate_model(
+    model: DQN,
+    args: argparse.Namespace,
+    seed: int,
+) -> tuple[float, float]:
+    eval_env = make_env(args.env_id, seed)
+    try:
+        mean_reward, std_reward = evaluate_policy(
+            model,
+            eval_env,
+            n_eval_episodes=args.eval_episodes,
+            deterministic=True,
+        )
+        return float(mean_reward), float(std_reward)
+    finally:
+        eval_env.close()
 
 
 def write_history(path: Path, history: list[dict[str, Any]], final_eval: dict[str, float]) -> None:
@@ -181,123 +178,110 @@ def write_history(path: Path, history: list[dict[str, Any]], final_eval: dict[st
 
 def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Namespace) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    model = make_model(args.env_id, args.seed + 20_000, args, None)
-    load_global_parameters(model, server.global_parameters)
-    model.save(path)
+    model = make_model(args.env_id, args.seed + 20_000, args)
+    try:
+        load_global_parameters(model, server.global_parameters)
+        model.save(path)
+    finally:
+        model.get_env().close()
+
 
 def save_video(path: Path, parameters: list[np.ndarray], args: argparse.Namespace) -> None:
-    #Here we save our server video.  Can be adapted to clients if necessary.
-    env = DummyVecEnv([make_video_env])
+    path.mkdir(parents=True, exist_ok=True)
+    env = DummyVecEnv([lambda: make_video_env(args.env_id)])
     env = VecVideoRecorder(
         env,
         path,
         record_video_trigger=lambda x: x == 0,
         video_length=args.video_step_length,
     )
-    model = DQN("MlpPolicy", env, verbose=1)
-    load_global_parameters(model, parameters)
+    try:
+        model = DQN("MlpPolicy", env, verbose=args.verbose)
+        load_global_parameters(model, parameters)
 
-    obs = env.reset()
-    for _ in range(args.video_step_length):
-        action, _states = model.predict(obs)
-        obs, rewards, dones, info = env.step(action)
-        env.render()
+        obs = env.reset()
+        for _ in range(args.video_step_length):
+            action, _states = model.predict(obs)
+            obs, rewards, dones, info = env.step(action)
+            env.render()
+    finally:
+        env.close()
 
-def push_timestep_data(run: wandb.sdk.wandb_run.Run,
-                       data: list[list],
-                       column_list: list, 
-                       title: str,
-                       x_var: str,
-                       y_var: str):
-    
-    table = wandb.Table(data=data, columns=column_list)
-    run.log({title : wandb.plot.line(table, x_var, y_var, title=title)})
 
 def main() -> None:
     args = parse_args()
-    #Here we create unique keys for the project based on the current datetime.
-    #We do the same for each client, then build our sever.
-    project_id = str(datetime.now()).split(".")[0].replace(" ","-").replace(":","")
-    client_id_list = [project_id + "-" + str(i) for i in range(args.num_clients)]
-    server = build_server(args, project_id, client_id_list)
 
-    #We now run our main loop.
-    #We save the metrics for loggin purposes and also extract them as lists
-    #in our data object which will be saved as a wandb table.
-    #After each training round, we push our tables so that the reward
-    #progress can be monitored as close to real time as possible.
-    #This could probably be done incrementally.  To improve.
-    column_list = ["round", "agent","total_timesteps", "mean_reward"]
-    title = "Mean Reward by Timestep"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    experiment_id = f"{args.algo}-fedavg-{args.env_id}-{timestamp}"
+    client_id_list = [f"client-{i}" for i in range(args.num_clients)]
+
+    wandb_runs = initialize_training_wandb(args, experiment_id, client_id_list)
+    
+    server = build_server(args, experiment_id, client_id_list, wandb_runs["client_sb3"])
+    centralized_model = make_model(args.env_id, args.seed + 30_000, args)
+
     history = []
-    server_data = []
-    data = [[] for i in range(args.num_rounds)]
-    t1 = time.time()
-    for i in range(args.num_rounds):
-        round_metrics = server.train_round(args.timesteps_per_round,
-                                           args.real_time_communication)
-        history.append(round_metrics)
-        print(
-            f"Round {round_metrics['round']}/{args.num_rounds} "
-            f"completed with {round_metrics['num_clients']} clients."
-        )
-
-        #Calculate Server reward.
-        mean_reward, std_reward = evaluate_global_model(server, args, None)
-        server_data.append([i, "server", (i+1)*args.timesteps_per_round, mean_reward])
-
-        #Append client metrics
-        for j in range(len(round_metrics["client_metrics"])):
-            data[j].append([i,
-                             j,
-                             round_metrics["client_metrics"][j]["total_timesteps"],
-                             round_metrics["client_metrics"][j]["mean_reward"]])
-
-        #Push data if we wish to do this in realtime.
-        if (args.real_time_communication) or ((i+1) == args.num_rounds):
-            #Now we post the server model statistics.
-            server_run = initialize_wandb(args=args,
-                                         project_id=project_id,
-                                         client_id=project_id + "-server",
-                                         resume=True,
-                                         total_timesteps=(i+1)*args.timesteps_per_round)
-            push_timestep_data(server_run,
-                                       data=server_data,
-                                       column_list=column_list,
-                                       title=title,
-                                       x_var="total_timesteps",
-                                       y_var="mean_reward")
-            
-            log_eval = {"mean_reward": mean_reward, "std_reward": std_reward, "eval_episodes": args.eval_episodes}
+    final_eval = {"mean_reward": 0.0, "std_reward": 0.0}
+    t1 = time.perf_counter()
+    try:
+        for i in range(args.num_rounds):
+            round_metrics = server.train_round(args.timesteps_per_round)
+            history.append(round_metrics)
             print(
-                f"Global evaluation after {str(i)} rounds: "
+                f"Round {round_metrics['round']}/{args.num_rounds} "
+                f"completed with {round_metrics['num_clients']} clients."
+            )
+
+            mean_reward, std_reward = evaluate_global_model(server, args)
+            final_eval = {"mean_reward": mean_reward, "std_reward": std_reward}
+            log_round_metrics(
+                round_index=i,
+                round_metrics=round_metrics,
+                mean_reward=mean_reward,
+                std_reward=std_reward,
+                elapsed_seconds=time.perf_counter() - t1,
+                args=args,
+                runs=wandb_runs["summary"],
+                client_runs=wandb_runs["client_summary"],
+            )
+
+            print(
+                f"Global evaluation after {i + 1} rounds: "
                 f"mean_reward={mean_reward:.2f}, std_reward={std_reward:.2f}"
             )
-            server_run.finish()
-            
-            #Now we push the client data.
-            for j in range(args.num_clients):
-                #Pushing this rounds data.
-                run = initialize_wandb(args=args,
-                                       project_id = project_id,
-                                       client_id=client_id_list[j],
-                                       resume=True,
-                                       total_timesteps=args.timesteps_per_round)
-                #Push our mean reward table
-                #We can also push some other data now that the connection is open.
-                push_timestep_data(run,
-                               data=data[j],
-                               column_list=column_list,
-                               title=title,
-                               x_var="total_timesteps",
-                               y_var="mean_reward")
-                run.finish()
-        
-        #Broadcast the parameters to each client.
-        server.broadcast(server.global_parameters)
-    t2 = time.time()
+
+            centralized_model.learn(
+                total_timesteps=args.timesteps_per_round,
+                reset_num_timesteps=False,
+            )
+            centralized_mean_reward, centralized_std_reward = evaluate_model(
+                centralized_model,
+                args,
+                args.seed + 10_000,
+            )
+            log_centralized_metrics(
+                round_index=i,
+                mean_reward=centralized_mean_reward,
+                std_reward=centralized_std_reward,
+                total_timesteps=centralized_model.num_timesteps,
+                args=args,
+                runs=wandb_runs["summary"],
+            )
+            print(
+                f"Centralized evaluation after {i + 1} rounds: "
+                f"timesteps={centralized_model.num_timesteps}, "
+                f"mean_reward={centralized_mean_reward:.2f}, "
+                f"std_reward={centralized_std_reward:.2f}"
+            )
+
+            server.broadcast(server.global_parameters)
+    finally:
+        centralized_model.get_env().close()
+        finish_wandb_runs(wandb_runs)
+
+    t2 = time.perf_counter()
     print("Calculation TIME")
-    print(t2 -t1)
+    print(t2 - t1)
     if args.history_json is not None:
         write_history(args.history_json, history, final_eval)
         print(f"Wrote history to {args.history_json}")
@@ -308,10 +292,11 @@ def main() -> None:
 
     if args.video_step_length > 0:
         parameters = server.global_parameters
-        save_video(path=f"videos/{project_id}",
-                            parameters=parameters,
-                            args=args)
-    server_run.finish()
+        save_video(
+            path=Path("videos") / experiment_id,
+            parameters=parameters,
+            args=args,
+        )
 
 if __name__ == "__main__":
     main()

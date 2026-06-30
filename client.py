@@ -5,8 +5,60 @@ import torch as th
 
 from stable_baselines3 import DQN
 from stable_baselines3.common.evaluation import evaluate_policy
-import wandb
-from wandb.integration.sb3 import WandbCallback
+from stable_baselines3.common.logger import KVWriter, Logger
+
+
+class WandbSB3OutputFormat(KVWriter):
+    """Write Stable-Baselines3 scalar logger values to one W&B run."""
+
+    def __init__(
+        self,
+        run: Any,
+        step_metric: str = "global_step",
+        metric_prefix: str | None = None,
+        include_unprefixed_metrics: bool = True,
+    ) -> None:
+        self.run = run
+        self.step_metric = step_metric
+        self.metric_prefix = metric_prefix.strip("/") if metric_prefix else None
+        self.include_unprefixed_metrics = include_unprefixed_metrics
+
+    def write(
+        self,
+        key_values: dict[str, Any],
+        key_excluded: dict[str, tuple[str, ...]],
+        step: int = 0,
+    ) -> None:
+        payload: dict[str, float | int] = {
+            self.step_metric: step,
+            "local step": step,
+        }
+        for key, value in key_values.items():
+            excluded = key_excluded.get(key, ())
+            if "wandb" in excluded:
+                continue
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, bool):
+                self._add_metric(payload, key, int(value))
+            elif isinstance(value, int | float):
+                self._add_metric(payload, key, value)
+
+        if len(payload) > 1:
+            self.run.log(payload, step=step)
+
+    def _add_metric(self, payload: dict[str, float | int], key: str, value: float | int) -> None:
+        if self.include_unprefixed_metrics:
+            payload[key] = value
+        payload[self._metric_name(key)] = value
+
+    def _metric_name(self, key: str) -> str:
+        if self.metric_prefix is None:
+            return key
+        return f"{self.metric_prefix}/{key}"
+
+    def close(self) -> None:
+        pass
 
 
 class FederatedDQNClient:
@@ -22,44 +74,39 @@ class FederatedDQNClient:
         client_id: str | int,
         project_id: str | int,
         model: DQN,
-        env_id: str,
         aggregation_weight: float = 1.0,
         sync_target_network: bool = True,
+        native_wandb_run: Any | None = None,
     ) -> None:
         self.client_id = client_id
         self.project_id = project_id
-        self.env_id = env_id
         self.model = model
         self.aggregation_weight = aggregation_weight
         self.sync_target_network = sync_target_network
+        self.native_wandb_run = native_wandb_run
 
-    def train(self,
-              total_timesteps: int,
-              wand_run_id: str | None,
-              **learn_kwargs: Any) -> dict[str, Any]:
+    def train(self, total_timesteps: int, **learn_kwargs: Any) -> dict[str, Any]:
         """Train the local DQN model for one federated round."""
         learn_kwargs.setdefault("reset_num_timesteps", False)
+        learn_kwargs.setdefault("tb_log_name", f"client_{self.client_id}")
         timesteps_before = self.model.num_timesteps
 
-        if wand_run_id is None:
-            self.model.learn(total_timesteps=total_timesteps,
-                             **learn_kwargs)
+        if self.native_wandb_run is None:
+            self.model.learn(total_timesteps=total_timesteps, **learn_kwargs)
         else:
-            config = {
-                "policy_type": "DQN",
-                "env_name": self.env_id,
-                "total_timesteps": (total_timesteps)
-            }
-            run = self.reinitialize_wandb(wand_run_id, config)
-            wandCallBack=WandbCallback(
-                gradient_save_freq=100,
-                model_save_path=f"models/{wand_run_id}",
-                verbose=2,
+            self.model.set_logger(
+                Logger(
+                    folder=None,
+                    output_formats=[
+                        WandbSB3OutputFormat(
+                            self.native_wandb_run,
+                            metric_prefix=str(self.client_id),
+                        )
+                    ],
+                )
             )
-            self.model.learn(total_timesteps=total_timesteps,
-                             callback=wandCallBack,
-                             **learn_kwargs)
-            run.finish()
+            self.model.learn(total_timesteps=total_timesteps, **learn_kwargs)
+
         trained_timesteps = self.model.num_timesteps - timesteps_before
         mean_reward, std_reward = evaluate_policy(self.model,
                         self.model.get_env(),
@@ -69,6 +116,7 @@ class FederatedDQNClient:
 
         return {
             "client_id": self.client_id,
+            "project_id": self.project_id,
             "timesteps": trained_timesteps,
             "total_timesteps": self.model.num_timesteps,
             "mean_reward": mean_reward,
@@ -100,20 +148,10 @@ class FederatedDQNClient:
         if self.sync_target_network:
             self.model.q_net_target.load_state_dict(state_dict)
 
-    def reinitialize_wandb(self, wand_run_id: str, config: dict):
-        run = wandb.init(
-                        project=self.project_id,
-                        id = wand_run_id,
-                        config=config,
-                        sync_tensorboard=True,
-                        resume = "must")
-        return run
-        
     def fit(
         self,
         parameters: Iterable[np.ndarray] | None,
         total_timesteps: int,
-        wand_run_id: str | None,
         **learn_kwargs: Any,
     ) -> tuple[list[np.ndarray], float, dict[str, Any]]:
         """
@@ -123,10 +161,5 @@ class FederatedDQNClient:
         if parameters is not None:
             self.set_parameters(parameters)
 
-        if wand_run_id is None:
-            metrics = self.train(total_timesteps, None, **learn_kwargs)
-        else:
-            metrics = self.train(total_timesteps, wand_run_id, **learn_kwargs)
+        metrics = self.train(total_timesteps, **learn_kwargs)
         return self.get_parameters(), self.aggregation_weight, metrics
-
-

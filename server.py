@@ -3,7 +3,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from client import FederatedDQNClient
-import wandb
+
 
 class FederatedDQNServer:
     """
@@ -21,24 +21,14 @@ class FederatedDQNServer:
         self.global_parameters = self.clients[0].get_parameters()
         self.round = 0
 
-    def train_round(self,
-                    total_timesteps: int,
-                    real_time_communication: bool,
-                    **learn_kwargs: Any) -> dict[str, Any]:
+    def train_round(self, total_timesteps: int, **learn_kwargs: Any) -> dict[str, Any]:
         """Run one federated round over all clients."""
         client_results = []
         
         for client in self.clients:
-            #Check if we want to monitor the training in real time.
-            #Note that this has costly connection steps and is incompatible with parallel processing.
-            if real_time_communication:
-                client_id_val = client.client_id
-            else:
-                client_id_val = None
             parameters, weight, metrics = client.fit(
                 self.global_parameters,
                 total_timesteps,
-                client_id_val,
                 **learn_kwargs,
             )
             client_results.append((parameters, weight, metrics))
@@ -47,8 +37,7 @@ class FederatedDQNServer:
             [parameters for parameters, _, _ in client_results],
             [weight for _, weight, _ in client_results],
         )
-        #We separate the broadcast step so that we can 
-        #self.broadcast(self.global_parameters)
+
         self.round += 1
 
         return {
@@ -62,15 +51,12 @@ class FederatedDQNServer:
         self,
         num_rounds: int,
         total_timesteps_per_round: int,
-        wand_run_id: str | None,
         **learn_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Run several federated rounds."""
         history = []
         for _ in range(num_rounds):
-            history.append(self.train_round(total_timesteps_per_round,
-                                            wand_run_id,
-                                            **learn_kwargs))
+            history.append(self.train_round(total_timesteps_per_round, **learn_kwargs))
         return history
 
     def broadcast(self, parameters: list[np.ndarray]) -> None:
@@ -110,5 +96,4 @@ class FederatedDQNServer:
             averaged_parameters.append(weighted_sum)
 
         return averaged_parameters
-
 

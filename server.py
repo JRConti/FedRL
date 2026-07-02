@@ -1,6 +1,7 @@
 from typing import Any, Iterable
 
 import numpy as np
+import torch as th
 
 from client import FederatedDQNClient
 
@@ -22,9 +23,16 @@ class FederatedDQNServer:
         self.round = 0
 
     def train_round(self, total_timesteps: int, **learn_kwargs: Any) -> dict[str, Any]:
-        """Run one federated round over all clients."""
+        """
+        Run one federated round and update global parameters.
+
+        Clients receive the current global parameters at the start of their
+        local fit. The newly aggregated global parameters are not broadcast
+        back to clients after the round.
+        """
         client_results = []
-        
+
+        # Distribute the current global parameters to all clients, train locally, and collect their updated parameters and metrics.
         for client in self.clients:
             parameters, weight, metrics = client.fit(
                 self.global_parameters,
@@ -33,9 +41,12 @@ class FederatedDQNServer:
             )
             client_results.append((parameters, weight, metrics))
 
+        # Aggregate the client parameters using their respective weights to update the global model.
+        client_parameters = [parameters for parameters, _, _ in client_results]
+        client_weights = [weight for _, weight, _ in client_results]
         self.global_parameters = self.aggregate(
-            [parameters for parameters, _, _ in client_results],
-            [weight for _, weight, _ in client_results],
+            client_parameters,
+            client_weights,
         )
 
         self.round += 1
@@ -45,30 +56,17 @@ class FederatedDQNServer:
             "num_clients": len(self.clients),
             "client_metrics": [metrics for _, _, metrics in client_results],
         }
-    
 
-    def train(
-        self,
-        num_rounds: int,
-        total_timesteps_per_round: int,
-        **learn_kwargs: Any,
-    ) -> list[dict[str, Any]]:
-        """Run several federated rounds."""
-        history = []
-        for _ in range(num_rounds):
-            history.append(self.train_round(total_timesteps_per_round, **learn_kwargs))
-        return history
-
-    def broadcast(self, parameters: list[np.ndarray]) -> None:
+    def broadcast(self, parameters: list[np.ndarray | th.Tensor]) -> None:
         """Send global parameters to every client."""
         for client in self.clients:
             client.set_parameters(parameters)
 
     @staticmethod
     def aggregate(
-        client_parameters: list[list[np.ndarray]],
+        client_parameters: list[list[np.ndarray | th.Tensor]],
         client_weights: list[float],
-    ) -> list[np.ndarray]:
+    ) -> list[np.ndarray | th.Tensor]:
         """Compute a weighted average of client parameters."""
         if not client_parameters:
             raise ValueError("No client parameters to aggregate.")
@@ -78,6 +76,8 @@ class FederatedDQNServer:
         total_weight = float(sum(client_weights))
         if total_weight <= 0:
             raise ValueError("The sum of client weights must be positive.")
+        if any(weight < 0 for weight in client_weights):
+            raise ValueError("Client weights must be non-negative.")
 
         num_tensors = len(client_parameters[0])
         for parameters in client_parameters:
@@ -85,15 +85,35 @@ class FederatedDQNServer:
                 raise ValueError("All clients must return the same number of tensors.")
 
         averaged_parameters = []
+        normalized_weights = [float(weight / total_weight) for weight in client_weights]
         for tensor_index in range(num_tensors):
-            weighted_sum = np.zeros_like(client_parameters[0][tensor_index])
+            first_tensor = client_parameters[0][tensor_index]
+            weighted_sum = (
+                th.zeros_like(first_tensor)
+                if isinstance(first_tensor, th.Tensor)
+                else np.zeros_like(first_tensor)
+            )
 
-            for parameters, weight in zip(client_parameters, client_weights):
-                if parameters[tensor_index].shape != weighted_sum.shape:
-                    raise ValueError("All matching tensors must have the same shape.")
-                weighted_sum += parameters[tensor_index] * (weight / total_weight)
+            for client_index, (parameters, weight) in enumerate(
+                zip(client_parameters, normalized_weights)
+            ):
+                if tuple(parameters[tensor_index].shape) != tuple(weighted_sum.shape):
+                    raise ValueError(
+                        f"Tensor {tensor_index} from client {client_index} has shape "
+                        f"{parameters[tensor_index].shape}, expected {weighted_sum.shape}."
+                    )
+                if isinstance(weighted_sum, th.Tensor):
+                    weighted_sum.add_(
+                        th.as_tensor(
+                            parameters[tensor_index],
+                            dtype=weighted_sum.dtype,
+                            device=weighted_sum.device,
+                        ),
+                        alpha=weight,
+                    )
+                else:
+                    weighted_sum += np.asarray(parameters[tensor_index]) * weight
 
             averaged_parameters.append(weighted_sum)
 
         return averaged_parameters
-

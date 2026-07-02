@@ -1,13 +1,16 @@
 import argparse
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-import numpy as np
+
 import gymnasium as gym
-from datetime import datetime
-import time
+import numpy as np
+import torch as th
 
 from client import FederatedDQNClient
+from config_dqn import DQNConfig
 from server import FederatedDQNServer
 from stable_baselines3 import DQN
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -21,22 +24,35 @@ from wandb_logging import (
 )
 
 
+ALGORITHMS = {
+    "DQN": DQN,
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a federated DQN with FedAvg.")
-    parser.add_argument("--algo", default="DQN", help="RL algorithm to use.")
+    parser.add_argument(
+        "--algo",
+        choices=tuple(ALGORITHMS),
+        default="DQN",
+        help="RL algorithm to use.",
+    )
     parser.add_argument("--env-id", default="CartPole-v1", help="Gymnasium environment id.")
-    parser.add_argument("--num-clients", type=int, default=2, help="Number of federated clients.")
-    parser.add_argument("--num-rounds", type=int, default=10, help="Number of federated rounds.")
+    parser.add_argument("--num-clients", type=int, default=1, help="Number of federated clients.")
+    # 2
+    parser.add_argument("--num-rounds", type=int, default=1_000, help="Number of federated rounds.") # 10
     parser.add_argument(
         "--timesteps-per-round",
         type=int,
-        default=1_000,
+        default=1_000, # 
         help="Local DQN timesteps per client and round.",
     )
     parser.add_argument("--eval-episodes", type=int, default=10, help="Evaluation episodes.")
     parser.add_argument("--seed", type=int, default=0, help="Base random seed.")
-    parser.add_argument("--learning-starts", type=int, default=100, help="DQN learning_starts.")
-    parser.add_argument("--buffer-size", type=int, default=50_000, help="DQN replay buffer size.")
+    parser.add_argument("--learning-starts", type=int, default=1, help="DQN learning_starts.") 
+    # 100
+
+    parser.add_argument("--buffer-size", type=int, default=1_000_000, help="DQN replay buffer size.")
     parser.add_argument("--batch-size", type=int, default=32, help="DQN batch size.")
     parser.add_argument("--verbose", type=int, default=0, help="Stable-Baselines3 verbosity.")
     parser.add_argument(
@@ -69,10 +85,16 @@ def make_env(env_id: str, seed: int) -> gym.Env:
     env.observation_space.seed(seed)
     return Monitor(env)
 
+
 def make_video_env(env_id: str) -> gym.Env:
     env = gym.make(env_id, render_mode="rgb_array")
     return env
-    
+
+
+def model_class(args: argparse.Namespace) -> type[DQN]:
+    return ALGORITHMS[getattr(args, "algo", "DQN")]
+
+
 def make_model(
     env_id: str,
     seed: int,
@@ -80,15 +102,11 @@ def make_model(
     tensorboard_log: str | None = None,
 ) -> DQN:
     env = make_env(env_id, seed)
-    return DQN(
-        "MlpPolicy",
+    config = DQNConfig.from_args(args)
+    return model_class(args)(
+        config.policy,
         env,
-        seed=seed,
-        learning_starts=args.learning_starts,
-        buffer_size=args.buffer_size,
-        batch_size=args.batch_size,
-        verbose=args.verbose,
-        tensorboard_log=tensorboard_log,
+        **config.to_kwargs(seed=seed, tensorboard_log=tensorboard_log),
     )
 
 
@@ -111,6 +129,7 @@ def build_server(
             client_id=client_id,
             project_id=experiment_id,
             model=model,
+            eval_episodes=args.eval_episodes,
             native_wandb_run=(
                 None if client_sb3_runs is None else client_sb3_runs.get(client_id)
             ),
@@ -119,13 +138,22 @@ def build_server(
     return FederatedDQNServer(clients)
 
 
-def load_global_parameters(model: DQN, parameters: list[np.ndarray]) -> None:
+def load_global_parameters(model: DQN, parameters: list[np.ndarray | th.Tensor]) -> None:
     state_dict = model.q_net.state_dict()
     if len(state_dict) != len(parameters):
         raise ValueError("Global parameters do not match the DQN Q-network.")
 
     for (name, old_tensor), new_value in zip(state_dict.items(), parameters):
-        state_dict[name] = old_tensor.new_tensor(new_value)
+        if tuple(new_value.shape) != tuple(old_tensor.shape):
+            raise ValueError(
+                f"Global parameter '{name}' has shape {tuple(new_value.shape)}, "
+                f"expected {tuple(old_tensor.shape)}."
+            )
+        state_dict[name] = th.as_tensor(
+            new_value,
+            dtype=old_tensor.dtype,
+            device=old_tensor.device,
+        )
 
     model.q_net.load_state_dict(state_dict)
     model.q_net_target.load_state_dict(state_dict)
@@ -134,37 +162,16 @@ def load_global_parameters(model: DQN, parameters: list[np.ndarray]) -> None:
 def evaluate_global_model(
     server: FederatedDQNServer,
     args: argparse.Namespace,
+    eval_model: DQN,
 ) -> tuple[float, float]:
-    eval_model = make_model(args.env_id, args.seed + 10_000, args)
-    try:
-        load_global_parameters(eval_model, server.global_parameters)
-        mean_reward, std_reward = evaluate_policy(
-            eval_model,
-            eval_model.get_env(),
-            n_eval_episodes=args.eval_episodes,
-            deterministic=True,
-        )
-        return float(mean_reward), float(std_reward)
-    finally:
-        eval_model.get_env().close()
-
-
-def evaluate_model(
-    model: DQN,
-    args: argparse.Namespace,
-    seed: int,
-) -> tuple[float, float]:
-    eval_env = make_env(args.env_id, seed)
-    try:
-        mean_reward, std_reward = evaluate_policy(
-            model,
-            eval_env,
-            n_eval_episodes=args.eval_episodes,
-            deterministic=True,
-        )
-        return float(mean_reward), float(std_reward)
-    finally:
-        eval_env.close()
+    load_global_parameters(eval_model, server.global_parameters)
+    mean_reward, std_reward = evaluate_policy(
+        eval_model,
+        eval_model.get_env(),
+        n_eval_episodes=args.eval_episodes,
+        deterministic=True,
+    )
+    return float(mean_reward), float(std_reward)
 
 
 def write_history(path: Path, history: list[dict[str, Any]], final_eval: dict[str, float]) -> None:
@@ -186,7 +193,12 @@ def save_global_model(path: Path, server: FederatedDQNServer, args: argparse.Nam
         model.get_env().close()
 
 
-def save_video(path: Path, parameters: list[np.ndarray], args: argparse.Namespace) -> None:
+def close_server_clients(server: FederatedDQNServer) -> None:
+    for client in server.clients:
+        client.model.get_env().close()
+
+
+def save_video(path: Path, parameters: list[np.ndarray | th.Tensor], args: argparse.Namespace) -> None:
     path.mkdir(parents=True, exist_ok=True)
     env = DummyVecEnv([lambda: make_video_env(args.env_id)])
     env = VecVideoRecorder(
@@ -196,7 +208,11 @@ def save_video(path: Path, parameters: list[np.ndarray], args: argparse.Namespac
         video_length=args.video_step_length,
     )
     try:
-        model = DQN("MlpPolicy", env, verbose=args.verbose)
+        model = model_class(args)(
+            "MlpPolicy",
+            env,
+            **DQNConfig.from_args(args).to_kwargs(seed=args.seed),
+        )
         load_global_parameters(model, parameters)
 
         obs = env.reset()
@@ -210,21 +226,26 @@ def save_video(path: Path, parameters: list[np.ndarray], args: argparse.Namespac
 
 def main() -> None:
     args = parse_args()
+    args.dqn_config = DQNConfig.from_args(args)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     experiment_id = f"{args.algo}-fedavg-{args.env_id}-{timestamp}"
     client_id_list = [f"client-{i}" for i in range(args.num_clients)]
 
     wandb_runs = initialize_training_wandb(args, experiment_id, client_id_list)
-    
+
     server = build_server(args, experiment_id, client_id_list, wandb_runs["client_sb3"])
     centralized_model = make_model(args.env_id, args.seed + 30_000, args)
+    centralized_eval_env = make_env(args.env_id, args.seed + 10_000)
+    global_eval_model = make_model(args.env_id, args.seed + 10_000, args)
 
     history = []
     final_eval = {"mean_reward": 0.0, "std_reward": 0.0}
     t1 = time.perf_counter()
     try:
         for i in range(args.num_rounds):
+
+            # Federated training round
             round_metrics = server.train_round(args.timesteps_per_round)
             history.append(round_metrics)
             print(
@@ -232,8 +253,15 @@ def main() -> None:
                 f"completed with {round_metrics['num_clients']} clients."
             )
 
-            mean_reward, std_reward = evaluate_global_model(server, args)
+            # Global evaluation of the aggregated model
+            mean_reward, std_reward = evaluate_global_model(
+                server,
+                args,
+                global_eval_model,
+            )
             final_eval = {"mean_reward": mean_reward, "std_reward": std_reward}
+
+            # Log clients/server metrics to WandB and print to console
             log_round_metrics(
                 round_index=i,
                 round_metrics=round_metrics,
@@ -244,21 +272,24 @@ def main() -> None:
                 runs=wandb_runs["summary"],
                 client_runs=wandb_runs["client_summary"],
             )
-
             print(
                 f"Global evaluation after {i + 1} rounds: "
                 f"mean_reward={mean_reward:.2f}, std_reward={std_reward:.2f}"
             )
 
+            # Centralized training and evaluation for comparison
             centralized_model.learn(
                 total_timesteps=args.timesteps_per_round,
                 reset_num_timesteps=False,
             )
-            centralized_mean_reward, centralized_std_reward = evaluate_model(
+            centralized_mean_reward, centralized_std_reward = evaluate_policy(
                 centralized_model,
-                args,
-                args.seed + 10_000,
+                centralized_eval_env,
+                n_eval_episodes=args.eval_episodes,
+                deterministic=True,
             )
+            centralized_mean_reward = float(centralized_mean_reward)
+            centralized_std_reward = float(centralized_std_reward)
             log_centralized_metrics(
                 round_index=i,
                 mean_reward=centralized_mean_reward,
@@ -273,10 +304,11 @@ def main() -> None:
                 f"mean_reward={centralized_mean_reward:.2f}, "
                 f"std_reward={centralized_std_reward:.2f}"
             )
-
-            server.broadcast(server.global_parameters)
     finally:
+        global_eval_model.get_env().close()
+        centralized_eval_env.close()
         centralized_model.get_env().close()
+        close_server_clients(server)
         finish_wandb_runs(wandb_runs)
 
     t2 = time.perf_counter()

@@ -1,7 +1,10 @@
 import os
 from typing import Any
 
+import numpy as np
 import wandb
+from config_dqn import DQNConfig
+from stable_baselines3.common.logger import KVWriter
 
 WANDB_PROJECT = "FedRL"
 
@@ -27,6 +30,71 @@ SUMMARY_PREFIXES = (
 SB3_PREFIXES = ("rollout", "train", "time")
 
 
+class WandbSB3OutputFormat(KVWriter):
+    """Write Stable-Baselines3 scalar logger values to one W&B run."""
+
+    def __init__(
+        self,
+        run: Any,
+        step_metric: str = GLOBAL_STEP_AXIS,
+        metric_prefix: str | None = None,
+        include_unprefixed_metrics: bool = True,
+    ) -> None:
+        self.run = run
+        self.step_metric = step_metric
+        self.metric_prefix = metric_prefix.strip("/") if metric_prefix else None
+        self.include_unprefixed_metrics = include_unprefixed_metrics
+
+    def write(
+        self,
+        key_values: dict[str, Any],
+        key_excluded: dict[str, tuple[str, ...]],
+        step: int = 0,
+    ) -> None:
+        payload: dict[str, float | int] = {
+            self.step_metric: step,
+            LOCAL_STEPS_AXIS: step,
+        }
+        for key, value in key_values.items():
+            excluded = key_excluded.get(key, ())
+            if "wandb" in excluded:
+                continue
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, bool):
+                self._add_metric(payload, key, int(value))
+            elif isinstance(value, int | float):
+                self._add_metric(payload, key, value)
+
+        if len(payload) > 1:
+            self.run.log(payload, step=step)
+
+    def _add_metric(
+        self,
+        payload: dict[str, float | int],
+        key: str,
+        value: float | int,
+    ) -> None:
+        if self.include_unprefixed_metrics:
+            payload[key] = value
+        payload[self._metric_name(key)] = value
+
+    def _metric_name(self, key: str) -> str:
+        if self.metric_prefix is None:
+            return key
+        return f"{self.metric_prefix}/{key}"
+
+    def close(self) -> None:
+        pass
+
+
+def dqn_config_payload(args: Any) -> dict[str, Any]:
+    config = getattr(args, "dqn_config", None)
+    if config is not None and hasattr(config, "to_wandb_config"):
+        return config.to_wandb_config()
+    return DQNConfig.from_args(args).to_wandb_config()
+
+
 def wandb_config(args: Any, experiment_id: str) -> dict[str, Any]:
     return {
         "experiment_id": experiment_id,
@@ -39,9 +107,7 @@ def wandb_config(args: Any, experiment_id: str) -> dict[str, Any]:
         "total_env_steps": args.num_rounds * args.timesteps_per_round * args.num_clients,
         "eval_episodes": args.eval_episodes,
         "seed": args.seed,
-        "learning_starts": args.learning_starts,
-        "buffer_size": args.buffer_size,
-        "batch_size": args.batch_size,
+        "dqn": dqn_config_payload(args),
     }
 
 

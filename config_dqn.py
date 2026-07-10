@@ -32,7 +32,7 @@ class DQNConfig:
     replay_buffer_kwargs: dict[str, Any] | None = None
     optimize_memory_usage: bool = False
     n_steps: int = 1
-    target_update_interval: int = 1_000                       # 10_000
+    target_update_interval: int = 10_000
     exploration_fraction: float = 0.1
     exploration_initial_eps: float = 1.0
     exploration_final_eps: float = 0.05

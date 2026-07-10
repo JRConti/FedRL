@@ -99,7 +99,7 @@ class DQNConfig:
         return config
 
     @classmethod
-    def from_dict(cls, param_dict) -> "DQNConfig":
+    def from_dict(cls, param_dict: dict) -> "DQNConfig":
         config = cls()
         config.learning_rate = param_dict.get("learning_rate",
                                               config.learning_rate)

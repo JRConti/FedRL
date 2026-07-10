@@ -97,3 +97,38 @@ class DQNConfig:
         config.batch_size = getattr(args, "batch_size", config.batch_size)
         config.verbose = getattr(args, "verbose", config.verbose)
         return config
+
+    @classmethod
+    def from_dict(cls, param_dict) -> "DQNConfig":
+        config = cls()
+        config.learning_rate = param_dict.get("learning_rate",
+                                              config.learning_rate)
+        config.learning_starts = param_dict.get("learning_starts",
+                                                config.learning_starts)
+        config.buffer_size =param_dict.get("buffer_size",
+                                           config.buffer_size)
+        config.batch_size = param_dict.get("batch_size",
+                                           config.batch_size)
+        config.verbose = param_dict.get("verbose",
+                                        config.verbose)
+        config.tau = param_dict.get("tau",
+                                    config.tau)
+        config.gamma = param_dict.get("gamma",
+                                      config.gamma)
+        config.train_freq = param_dict.get("train_freq",
+                                           config.train_freq)
+        config.gradient_steps = param_dict.get("gradient_steps",
+                                               config.gradient_steps)
+        config.n_steps = param_dict.get("n_steps",
+                                        config.n_steps)
+        config.target_update_interval = param_dict.get("target_update_interval",
+                                                       config.target_update_interval)
+        config.exploration_fraction = param_dict.get("exploration_fraction",
+                                                     config.exploration_fraction)
+        config.exploration_initial_eps = param_dict.get("exploration_initial_eps",
+                                                        config.exploration_initial_eps)
+        config.exploration_final_eps = param_dict.get("exploration_final_eps",
+                                                      config.exploration_final_eps)
+        config.max_grad_norm = param_dict.get("max_grad_norm",
+                                              config.max_grad_norm)
+        return config

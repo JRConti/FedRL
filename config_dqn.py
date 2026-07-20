@@ -92,8 +92,28 @@ class DQNConfig:
     @classmethod
     def from_args(cls, args: Any) -> "DQNConfig":
         config = cls()
-        config.learning_starts = getattr(args, "learning_starts", config.learning_starts)
-        config.buffer_size = getattr(args, "buffer_size", config.buffer_size)
-        config.batch_size = getattr(args, "batch_size", config.batch_size)
-        config.verbose = getattr(args, "verbose", config.verbose)
+        for field_name in ("learning_starts", "buffer_size", "batch_size", "verbose"):
+            value = getattr(args, field_name, None)
+            if value is not None:
+                setattr(config, field_name, value)
         return config
+
+
+# Shared CartPole configuration used by both centralized and federated runs.
+CARTPOLE_DQN_CONFIG = DQNConfig(
+    policy="MlpPolicy",
+    learning_rate=2.3e-3,
+    batch_size=64,
+    buffer_size=100_000,
+    learning_starts=1_000,
+    gamma=0.99,
+    target_update_interval=10,
+    train_freq=256,
+    gradient_steps=128,
+    exploration_fraction=0.16,
+    exploration_final_eps=0.04,
+    net_arch=[256, 256],
+    seed=2,
+    device="cpu",
+    verbose=1,
+)

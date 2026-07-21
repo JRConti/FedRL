@@ -88,14 +88,12 @@ class WandbSB3OutputFormat(KVWriter):
         pass
 
 
-def dqn_config_payload(args: Any) -> dict[str, Any]:
-    config = getattr(args, "dqn_config", None)
-    if config is not None and hasattr(config, "to_wandb_config"):
-        return config.to_wandb_config()
-    return DQNConfig.from_args(args).to_wandb_config()
-
-
-def wandb_config(args: Any, experiment_id: str) -> dict[str, Any]:
+def wandb_config(
+    args: Any,
+    experiment_id: str,
+    dqn_config: DQNConfig,
+    seed: int,
+) -> dict[str, Any]:
     return {
         "experiment_id": experiment_id,
         "policy_type": "DQN",
@@ -106,14 +104,16 @@ def wandb_config(args: Any, experiment_id: str) -> dict[str, Any]:
         "total_client_timesteps": args.num_rounds * args.timesteps_per_round,
         "total_env_steps": args.num_rounds * args.timesteps_per_round * args.num_clients,
         "eval_episodes": args.eval_episodes,
-        "seed": args.seed,
-        "dqn": dqn_config_payload(args),
+        "seed": seed,
+        "dqn": dqn_config.to_wandb_config(),
     }
 
 
 def make_wandb_run(
     args: Any,
     experiment_id: str,
+    dqn_config: DQNConfig,
+    seed: int,
     name: str,
     job_type: str,
     tags: list[str],
@@ -126,7 +126,7 @@ def make_wandb_run(
         "group": experiment_id,
         "job_type": job_type,
         "tags": [experiment_id, *tags],
-        "config": wandb_config(args, experiment_id),
+        "config": wandb_config(args, experiment_id, dqn_config, seed),
     }
     if reinit:
         init_kwargs["reinit"] = "create_new"
@@ -166,6 +166,8 @@ def initialize_training_wandb(
     args: Any,
     experiment_id: str,
     client_ids: list[str],
+    dqn_config: DQNConfig,
+    seed: int,
 ) -> dict[str, Any]:
     """Open all W&B runs needed by one training experiment.
 
@@ -177,6 +179,8 @@ def initialize_training_wandb(
         ROUND_AXIS: make_wandb_run(
             args,
             experiment_id,
+            dqn_config,
+            seed,
             "summary/rounds",
             job_type="summary",
             tags=["summary", "rounds"],
@@ -185,6 +189,8 @@ def initialize_training_wandb(
         LOCAL_STEPS_AXIS: make_wandb_run(
             args,
             experiment_id,
+            dqn_config,
+            seed,
             "summary/local-steps",
             job_type="summary",
             tags=["summary", "local-steps"],
@@ -202,6 +208,8 @@ def initialize_training_wandb(
             ROUND_AXIS: make_wandb_run(
                 args,
                 experiment_id,
+                dqn_config,
+                seed,
                 f"{client_id}/rounds",
                 job_type="client",
                 tags=["client", client_id, "rounds"],
@@ -209,6 +217,8 @@ def initialize_training_wandb(
             LOCAL_STEPS_AXIS: make_wandb_run(
                 args,
                 experiment_id,
+                dqn_config,
+                seed,
                 f"{client_id}/local-steps",
                 job_type="client",
                 tags=["client", client_id, "local-steps"],
@@ -220,6 +230,8 @@ def initialize_training_wandb(
         run = make_wandb_run(
             args,
             experiment_id,
+            dqn_config,
+            seed,
             f"{client_id}/sb3",
             job_type="client",
             tags=["client", client_id, "sb3"],

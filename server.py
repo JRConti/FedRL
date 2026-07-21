@@ -22,7 +22,7 @@ class FederatedDQNServer:
         self.global_parameters = self.clients[0].get_parameters()
         self.round = 0
 
-    def train_round(self, total_timesteps: int, **learn_kwargs: Any) -> dict[str, Any]:
+    def train_round(self, total_timesteps: int, broadcast: bool = True, **learn_kwargs: Any) -> dict[str, Any]:
         """
         Run one federated round and update global parameters.
 
@@ -34,8 +34,14 @@ class FederatedDQNServer:
 
         # Distribute the current global parameters to all clients, train locally, and collect their updated parameters and metrics.
         for client in self.clients:
+            # If broadcast is True, send the current global parameters to the client. Otherwise, the client will use its own parameters for local training.
+            if broadcast:
+                broadcast_parameters = self.global_parameters
+            else:
+                broadcast_parameters = None  # Clients will use their own parameters if not broadcasting.
+            
             parameters, weight, metrics = client.fit(
-                self.global_parameters,
+                broadcast_parameters,
                 total_timesteps,
                 **learn_kwargs,
             )
@@ -58,7 +64,8 @@ class FederatedDQNServer:
         }
 
     def broadcast(self, parameters: list[np.ndarray | th.Tensor]) -> None:
-        """Send global parameters to every client."""
+        """Send global parameters to every client.
+        Not used for now."""
         for client in self.clients:
             client.set_parameters(parameters)
 

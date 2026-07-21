@@ -3,18 +3,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from config_dqn import CARTPOLE_DQN_CONFIG
+from config_dqn import DQNConfig, get_rb3_dqn_config
 from dqn_experiment import (
     build_federated_server,
     close_federated_server,
-    evaluate_dqn,
     load_q_network_parameters,
-    make_dqn_env,
     make_dqn_model,
     record_global_model,
     save_global_model,
     write_history,
 )
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.evaluation import evaluate_policy
 from wandb_logging import (
     finish_wandb_runs,
     initialize_training_wandb,
@@ -23,10 +24,12 @@ from wandb_logging import (
 )
 
 
+BROADCAST = False # whether to broadcast the global model to clients after each federated round
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a federated DQN with FedAvg.")
     parser.add_argument("--env-id", default="CartPole-v1", help="Gymnasium environment id.")
-    parser.add_argument("--num-clients", type=int, default=2, help="Number of federated clients.")
+    parser.add_argument("--num-clients", type=int, default=1, help="Number of federated clients.")
     parser.add_argument(
         "--num-rounds",
         type=int,
@@ -60,41 +63,90 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path where round metrics are written as JSON.",
     )
-    args = parser.parse_args()
-    args.seed = CARTPOLE_DQN_CONFIG.seed or 0
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    args.dqn_config = CARTPOLE_DQN_CONFIG
+
+    # Choice 1: SB3 default parameters
+    # dqn_config = DQNConfig()
+
+    # Choice 2: tuned RL-Zoo parameters (if available for the environment, in hyperparams_rl_zoo folder)
+    dqn_config = get_rb3_dqn_config(args.env_id)
+
+    # # Choice 3: custom parameters
+    # dqn_config = DQNConfig(
+    #     policy="MlpPolicy",
+    #     learning_rate=2.3e-3,
+    #     batch_size=64,
+    #     buffer_size=100_000,
+    #     learning_starts=1_000,
+    #     gamma=0.99,
+    #     target_update_interval=10,
+    #     train_freq=256,
+    #     gradient_steps=128,
+    #     exploration_fraction=0.16,
+    #     exploration_final_eps=0.04,
+    #     net_arch=[256, 256],
+    # )
+
+    seed = dqn_config.seed if dqn_config.seed is not None else 2
+    set_random_seed(seed) # SB3 fixing seed for reproducibility. See https://stable-baselines3.readthedocs.io/en/master/guide/examples.html#fixing-random-seeds-for-reproducibility
+
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     experiment_id = f"DQN-fedavg-{args.env_id}-{timestamp}"
     client_id_list = [f"client-{i}" for i in range(args.num_clients)]
 
-    wandb_runs = initialize_training_wandb(args, experiment_id, client_id_list)
+    wandb_runs = None
+    server = None
+    global_eval_model = None
+    centralized_model = None
+    centralized_eval_env = None
 
-    server = build_federated_server(
-        env_id=args.env_id,
-        base_seed=args.seed,
-        client_ids=client_id_list,
-        experiment_id=experiment_id,
-        eval_episodes=args.eval_episodes,
-        client_sb3_runs=wandb_runs["client_sb3"],
-    )
-    centralized_model = make_dqn_model(args.env_id, args.seed)
-    centralized_eval_env = make_dqn_env(args.env_id, args.seed)
-    global_eval_model = make_dqn_model(args.env_id, args.seed)
-
-    history = []
-    final_eval = {"mean_reward": 0.0, "std_reward": 0.0}
-    t1 = time.perf_counter()
     try:
+        wandb_runs = initialize_training_wandb(
+            args,
+            experiment_id,
+            client_id_list,
+            dqn_config=dqn_config,
+            seed=seed,
+        )
+
+        # define clients and server
+        server = build_federated_server(
+            env_id=args.env_id,
+            base_seed=seed,
+            client_ids=client_id_list,
+            dqn_config=dqn_config,
+            eval_episodes=args.eval_episodes,
+            client_sb3_runs=wandb_runs["client_sb3"],
+        )
+
+        # define a global model for evaluation of the aggregated parameters
+        global_eval_model = make_dqn_model(
+            args.env_id,
+            seed,
+            dqn_config=dqn_config,
+        )
+
+        # define a centralized model for comparison with federated training
+        centralized_model = make_dqn_model(
+            args.env_id,
+            seed,
+            dqn_config=dqn_config,
+        )
+        # eval env for centralized model
+        centralized_eval_env = make_vec_env(args.env_id, n_envs=1, seed=seed)
+
+        history = []
+        final_eval = {"mean_reward": 0.0, "std_reward": 0.0}
+        t1 = time.perf_counter()
         for i in range(args.num_rounds):
 
-            # Federated training round
-            round_metrics = server.train_round(args.timesteps_per_round)
+            # Federated training round (clients train/eval locally and send parameters to server for aggregation)
+            round_metrics = server.train_round(args.timesteps_per_round, broadcast=BROADCAST)
             history.append(round_metrics)
             print(
                 f"Round {round_metrics['round']}/{args.num_rounds} "
@@ -106,11 +158,13 @@ def main() -> None:
                 global_eval_model,
                 server.global_parameters,
             )
-            mean_reward, std_reward = evaluate_dqn(
+            mean_reward, std_reward = evaluate_policy(
                 global_eval_model,
                 global_eval_model.get_env(),
-                args.eval_episodes,
+                n_eval_episodes=args.eval_episodes,
+                deterministic=True,
             )
+            mean_reward, std_reward = float(mean_reward), float(std_reward)
             final_eval = {"mean_reward": mean_reward, "std_reward": std_reward}
 
             # Log clients/server metrics to WandB and print to console
@@ -129,16 +183,24 @@ def main() -> None:
                 f"mean_reward={mean_reward:.2f}, std_reward={std_reward:.2f}"
             )
 
+
+
+
             # Centralized training and evaluation for comparison
             centralized_model.learn(
                 total_timesteps=args.timesteps_per_round,
                 reset_num_timesteps=False,
             )
-            centralized_mean_reward, centralized_std_reward = evaluate_dqn(
+            centralized_mean_reward, centralized_std_reward = evaluate_policy(
                 centralized_model,
                 centralized_eval_env,
-                args.eval_episodes,
+                n_eval_episodes=args.eval_episodes,
+                deterministic=True,
             )
+            centralized_mean_reward = float(centralized_mean_reward)
+            centralized_std_reward = float(centralized_std_reward)
+            
+            # Log centralized metrics to WandB and print to console
             log_centralized_metrics(
                 round_index=i,
                 mean_reward=centralized_mean_reward,
@@ -154,11 +216,16 @@ def main() -> None:
                 f"std_reward={centralized_std_reward:.2f}"
             )
     finally:
-        global_eval_model.get_env().close()
-        centralized_eval_env.close()
-        centralized_model.get_env().close()
-        close_federated_server(server)
-        finish_wandb_runs(wandb_runs)
+        if global_eval_model is not None:
+            global_eval_model.get_env().close()
+        if centralized_eval_env is not None:
+            centralized_eval_env.close()
+        if centralized_model is not None:
+            centralized_model.get_env().close()
+        if server is not None:
+            close_federated_server(server)
+        if wandb_runs is not None:
+            finish_wandb_runs(wandb_runs)
 
     t2 = time.perf_counter()
     print("Calculation TIME")
@@ -172,7 +239,8 @@ def main() -> None:
             args.save_model,
             server.global_parameters,
             args.env_id,
-            args.seed + 20_000,
+            seed + 20_000,
+            dqn_config=dqn_config,
         )
         print(f"Saved final global model to {args.save_model}")
 
@@ -181,8 +249,9 @@ def main() -> None:
             path=Path("videos") / experiment_id,
             parameters=server.global_parameters,
             env_id=args.env_id,
-            seed=args.seed,
+            seed=seed,
             video_length=args.video_step_length,
+            dqn_config=dqn_config,
         )
 
 

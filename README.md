@@ -1,5 +1,9 @@
 # FedRL
 
+# Problem: when comparing fed with centralized in main.py, we divide the training of 
+# centralized in several blocks/rounds, but that is not equivalent to a centralized,
+# as some internal params (eg exploration) depend on the unique call to learn() !
+
 1) Lancer 1 DQN simple et vérifier qu'on a les mêmes perfs en monitoring que StableBaselines (https://wandb.ai/openrlbenchmark/sb3/workspace?nw=nwuseraraffin)
 
 3) Clean (federated) code

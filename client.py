@@ -21,18 +21,18 @@ class FederatedDQNClient:
     def __init__(
         self,
         client_id: str | int,
-        project_id: str | int,
         model: DQN,
+        eval_env: Any,
         aggregation_weight: float = 1.0,
         sync_target_network: bool = True,
         eval_episodes: int = 10,
         native_wandb_run: Any | None = None,
     ) -> None:
         self.client_id = client_id
-        self.project_id = project_id
         self.model = model
         self.aggregation_weight = aggregation_weight
         self.sync_target_network = sync_target_network
+        self.eval_env = eval_env
         self.eval_episodes = eval_episodes
         self.native_wandb_run = native_wandb_run
         self._configure_logger()
@@ -48,13 +48,12 @@ class FederatedDQNClient:
         trained_timesteps = self.model.num_timesteps - timesteps_before
         mean_reward, std_reward = evaluate_policy(
             self.model,
-            self.model.get_env(),
+            self.eval_env,
             n_eval_episodes=self.eval_episodes,
             deterministic=True,
         )
 
         return {
-            "project_id": self.project_id,
             "client_id": self.client_id,
             "timesteps": trained_timesteps,
             "total_timesteps": self.model.num_timesteps,

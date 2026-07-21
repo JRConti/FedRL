@@ -6,44 +6,28 @@ import numpy as np
 import torch as th
 from stable_baselines3 import DQN
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import VecEnv, VecVideoRecorder
+from stable_baselines3.common.vec_env import VecVideoRecorder
 
 from client import FederatedDQNClient
-from config_dqn import CARTPOLE_DQN_CONFIG
+from config_dqn import DQNConfig
 from server import FederatedDQNServer
 
 
 Parameters = Iterable[np.ndarray | th.Tensor]
 
 
-def make_dqn_env(
-    env_id: str,
-    seed: int,
-    *,
-    render_mode: str | None = None,
-) -> VecEnv:
-    env_kwargs = None if render_mode is None else {"render_mode": render_mode}
-    return make_vec_env(
-        env_id,
-        n_envs=1,
-        seed=seed,
-        env_kwargs=env_kwargs,
-    )
-
-
 def make_dqn_model(
     env_id: str,
     seed: int,
-    *,
+    dqn_config: DQNConfig,
     tensorboard_log: str | None = None,
 ) -> DQN:
-    env = make_dqn_env(env_id, seed)
+    env = make_vec_env(env_id, n_envs=1, seed=seed)
     try:
         return DQN(
-            CARTPOLE_DQN_CONFIG.policy,
+            dqn_config.policy,
             env,
-            **CARTPOLE_DQN_CONFIG.to_kwargs(
+            **dqn_config.to_kwargs(
                 seed=seed,
                 tensorboard_log=tensorboard_log,
             ),
@@ -80,37 +64,25 @@ def load_q_network_parameters(model: DQN, parameters: Parameters) -> None:
     )
 
 
-def evaluate_dqn(
-    model: DQN,
-    env: VecEnv,
-    eval_episodes: int,
-) -> tuple[float, float]:
-    mean_reward, std_reward = evaluate_policy(
-        model,
-        env,
-        n_eval_episodes=eval_episodes,
-        deterministic=True,
-    )
-    return float(mean_reward), float(std_reward)
-
-
 def build_federated_server(
     env_id: str,
     base_seed: int,
     client_ids: list[str],
-    experiment_id: str,
+    dqn_config: DQNConfig,
     eval_episodes: int,
     client_sb3_runs: dict[str, Any] | None = None,
 ) -> FederatedDQNServer:
     clients = []
     try:
         for index, client_id in enumerate(client_ids):
-            model = make_dqn_model(env_id, base_seed + index)
+            client_seed = base_seed + index
+            model = make_dqn_model(env_id, client_seed, dqn_config=dqn_config)
+            eval_env = make_vec_env(env_id, n_envs=1, seed=client_seed)
             clients.append(
                 FederatedDQNClient(
                     client_id=client_id,
-                    project_id=experiment_id,
                     model=model,
+                    eval_env=eval_env,
                     eval_episodes=eval_episodes,
                     native_wandb_run=(
                         None
@@ -122,6 +94,7 @@ def build_federated_server(
     except Exception:
         for client in clients:
             client.model.get_env().close()
+            client.eval_env.close()
         raise
     return FederatedDQNServer(clients)
 
@@ -129,6 +102,7 @@ def build_federated_server(
 def close_federated_server(server: FederatedDQNServer) -> None:
     for client in server.clients:
         client.model.get_env().close()
+        client.eval_env.close()
 
 
 def save_global_model(
@@ -136,9 +110,10 @@ def save_global_model(
     parameters: Parameters,
     env_id: str,
     seed: int,
+    dqn_config: DQNConfig,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    model = make_dqn_model(env_id, seed)
+    model = make_dqn_model(env_id, seed, dqn_config=dqn_config)
     try:
         load_q_network_parameters(model, parameters)
         model.save(path)
@@ -152,18 +127,24 @@ def record_global_model(
     env_id: str,
     seed: int,
     video_length: int,
+    dqn_config: DQNConfig,
 ) -> None:
     env = VecVideoRecorder(
-        make_dqn_env(env_id, seed, render_mode="rgb_array"),
+        make_vec_env(
+            env_id,
+            n_envs=1,
+            seed=seed,
+            env_kwargs={"render_mode": "rgb_array"},
+        ),
         str(path),
         record_video_trigger=lambda step: step == 0,
         video_length=video_length,
     )
     try:
         model = DQN(
-            CARTPOLE_DQN_CONFIG.policy,
+            dqn_config.policy,
             env,
-            **CARTPOLE_DQN_CONFIG.to_kwargs(seed=seed),
+            **dqn_config.to_kwargs(seed=seed),
         )
         load_q_network_parameters(model, parameters)
 
